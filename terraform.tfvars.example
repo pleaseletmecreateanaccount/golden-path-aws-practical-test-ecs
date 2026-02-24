@@ -1,0 +1,39 @@
+# ==============================================================================
+# terraform.tfvars — Development Environment Values
+# Copy to terraform.tfvars and customise. Do NOT commit secrets here.
+# ==============================================================================
+
+aws_region   = "us-east-1"
+project_name = "golden-path"
+environment  = "dev"
+
+# Networking
+vpc_cidr             = "10.0.0.0/16"
+public_subnet_cidrs  = ["10.0.101.0/24", "10.0.102.0/24"]
+private_subnet_cidrs = ["10.0.1.0/24",   "10.0.2.0/24"]
+
+# App
+app_name          = "hello-world"
+app_image         = "nginx:1.27-alpine"  # Public image — no auth needed
+app_port          = 80
+app_cpu           = 256    # 0.25 vCPU — minimum Fargate unit
+app_memory        = 512    # 512 MiB  — minimum paired with 256 CPU
+app_desired_count = 2      # 2 tasks across 2 AZs for high availability
+app_min_count     = 1      # Scale in to 1 when idle
+app_max_count     = 4      # Scale out to 4 under load
+
+cpu_scale_target  = 60     # Scale out when average CPU > 60%
+
+# Secrets
+db_password_secret_name = "golden-path/dev/db-password"
+
+# ⚠️  COST NOTES:
+#   Fargate Spot:    ~$0.010/vCPU-hr (vs $0.04 On-Demand) — 75% cheaper
+#   ALB:             ~$0.008/hr base + $0.008/LCU-hr
+#   NAT Gateway:     ~$0.045/hr + $0.045/GB — biggest ongoing cost
+#   Secrets Manager: $0.40/secret/month (30-day free trial per secret)
+#   ECS Cluster:     FREE (you pay for Fargate task resources only)
+#   VPC/Subnets/IGW: FREE
+#   S3 (state):      FREE (5 GB, 12 months new accounts)
+#   DynamoDB (lock): FREE (always-free tier, 25 WCU/RCU)
+#   CloudWatch basic: FREE (10 custom metrics, 3 dashboards)
