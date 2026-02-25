@@ -54,8 +54,7 @@ jobs:
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
             -backend-config="key=golden-path/dev/terraform.tfstate" \
             -backend-config="region=${{ env.AWS_REGION }}" \
-            -backend-config="encrypt=true" \
-            -backend-config="use_lockfile=true"
+            -backend-config="encrypt=true"
         working-directory: ${{ env.TF_WORK_DIR }}
 
       - name: Terraform Validate
@@ -130,8 +129,7 @@ jobs:
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
             -backend-config="key=golden-path/dev/terraform.tfstate" \
             -backend-config="region=${{ env.AWS_REGION }}" \
-            -backend-config="encrypt=true" \
-            -backend-config="use_lockfile=true"
+            -backend-config="encrypt=true"
         working-directory: ${{ env.TF_WORK_DIR }}
 
       - name: Download plan artifact
