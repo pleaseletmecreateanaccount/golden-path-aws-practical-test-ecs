@@ -2,13 +2,19 @@
 # Root Orchestrator — wires all modules together
 # ==============================================================================
 
-locals {
-  name_prefix  = "${var.project_name}-${var.environment}"
-  account_id   = data.aws_caller_identity.current.account_id
-  region       = data.aws_region.current.name
+resource "random_string" "s3_suffix" {
+  length  = 6
+  special = false
+  upper   = false
+}
 
-  # S3 bucket for app data (IRSA-equivalent access)
-  app_s3_bucket = var.app_s3_bucket_name != "" ? var.app_s3_bucket_name : "${local.name_prefix}-app-data-${local.account_id}"
+locals {
+  name_prefix = "${var.project_name}-${var.environment}"
+  account_id  = data.aws_caller_identity.current.account_id
+  region      = data.aws_region.current.name
+
+  # S3 bucket for app data (IRSA-equivalent access) — add random suffix to avoid name collisions
+  app_s3_bucket = var.app_s3_bucket_name != "" ? var.app_s3_bucket_name : "${local.name_prefix}-app-data-${local.account_id}-${random_string.s3_suffix.result}"
 }
 
 # ------------------------------------------------------------------------------
@@ -34,11 +40,11 @@ module "networking" {
 module "iam" {
   source = "./modules/iam"
 
-  name_prefix      = local.name_prefix
-  account_id       = local.account_id
-  region           = local.region
-  app_s3_bucket    = local.app_s3_bucket
-  secret_arn       = module.secrets.secret_arn
+  name_prefix   = local.name_prefix
+  account_id    = local.account_id
+  region        = local.region
+  app_s3_bucket = local.app_s3_bucket
+  secret_arn    = module.secrets.secret_arn
 }
 
 # ------------------------------------------------------------------------------
@@ -120,10 +126,10 @@ module "ecs" {
 module "observability" {
   source = "./modules/observability"
 
-  name_prefix  = local.name_prefix
-  region       = local.region
-  ecs_cluster  = module.ecs.cluster_name
-  ecs_service  = module.ecs.service_name
+  name_prefix    = local.name_prefix
+  region         = local.region
+  ecs_cluster    = module.ecs.cluster_name
+  ecs_service    = module.ecs.service_name
   alb_arn_suffix = module.ecs.alb_arn_suffix
   tg_arn_suffix  = module.ecs.tg_arn_suffix
 }

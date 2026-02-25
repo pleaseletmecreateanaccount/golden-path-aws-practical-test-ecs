@@ -92,7 +92,7 @@ resource "aws_iam_role_policy_attachment" "task_execution_secrets" {
 resource "aws_iam_role" "task" {
   name               = "${var.name_prefix}-ecs-task-role"
   assume_role_policy = data.aws_iam_policy_document.ecs_assume_role.json
-  description        = "Assumed by the app container — grants S3 access without static keys"
+  description        = "Assumed by the app container - grants S3 access without static keys"
 }
 
 # Minimal S3 permissions: read/write only to the app's own bucket + prefix
@@ -123,7 +123,7 @@ data "aws_iam_policy_document" "task_s3" {
 
 resource "aws_iam_policy" "task_s3" {
   name        = "${var.name_prefix}-task-s3-policy"
-  description = "S3 access for ECS task role (no static keys — uses metadata endpoint)"
+  description = "S3 access for ECS task role (no static keys - uses metadata endpoint)"
   policy      = data.aws_iam_policy_document.task_s3.json
 }
 

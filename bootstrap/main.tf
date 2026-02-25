@@ -1,11 +1,15 @@
 # ==============================================================================
 # STEP 0 — Bootstrap (Run Once Before Everything Else)
-# Creates the S3 bucket + DynamoDB table that stores Terraform state.
+# Creates the S3 bucket that stores Terraform remote state.
+#
+# S3 native locking (use_lockfile = true) is used in backend.tf —
+# no DynamoDB table is needed.
 #
 # Usage:
 #   cd bootstrap/
-#   terraform init && terraform apply
-#   Copy the "backend_config" output into ../backend.tf
+#   terraform init
+#   terraform apply
+#   Copy the "backend_config_snippet" output into ../backend.tf
 # ==============================================================================
 
 terraform {
@@ -15,39 +19,44 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.0"
+    }
   }
-  # Bootstrap itself uses LOCAL state intentionally (chicken-and-egg problem)
 }
 
 provider "aws" {
   region = var.aws_region
 }
 
+provider "random" {}
+
 variable "aws_region" {
-  description = "AWS region"
+  description = "AWS region — must match the region in backend.tf and terraform.tfvars"
   type        = string
-  default     = "us-east-1"
+  default     = "ap-southeast-1"
 }
 
 variable "project_name" {
-  description = "Short project identifier used in resource names"
+  description = "aws-practical-test"
   type        = string
   default     = "golden-path"
 }
 
 data "aws_caller_identity" "current" {}
 
-# ------------------------------------------------------------------------------
-# S3 Bucket — Remote State Storage
-# Cost note: S3 Standard is free for 5 GB / 12 months (new accounts).
-#            State files are tiny (KBs) so this effectively costs nothing.
-# ------------------------------------------------------------------------------
+resource "random_string" "bucket_suffix" {
+  length  = 8
+  special = false
+  upper   = false
+}
 
 resource "aws_s3_bucket" "tfstate" {
-  bucket = "${var.project_name}-tfstate-${data.aws_caller_identity.current.account_id}"
+  bucket = "${var.project_name}-tfstate-${data.aws_caller_identity.current.account_id}-${random_string.bucket_suffix.result}"
 
   lifecycle {
-    prevent_destroy = true # Never accidentally delete state
+    prevent_destroy = true
   }
 
   tags = {
@@ -59,7 +68,7 @@ resource "aws_s3_bucket" "tfstate" {
 resource "aws_s3_bucket_versioning" "tfstate" {
   bucket = aws_s3_bucket.tfstate.id
   versioning_configuration {
-    status = "Enabled" # Enables state recovery after bad applies
+    status = "Enabled"
   }
 }
 
@@ -67,7 +76,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "tfstate" {
   bucket = aws_s3_bucket.tfstate.id
   rule {
     apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256" # S3-managed keys — no cost
+      sse_algorithm = "AES256"
     }
   }
 }
@@ -80,57 +89,20 @@ resource "aws_s3_bucket_public_access_block" "tfstate" {
   restrict_public_buckets = true
 }
 
-# ------------------------------------------------------------------------------
-# DynamoDB Table — State Locking
-# Cost note: DynamoDB free tier is always free (25 GB + 25 WCU/RCU).
-#            State lock operations are trivially small vs. that limit.
-# ------------------------------------------------------------------------------
 
-resource "aws_dynamodb_table" "tfstate_lock" {
-  name         = "${var.project_name}-tfstate-lock"
-  billing_mode = "PAY_PER_REQUEST" # Only pay per op; free tier covers lock ops
-  hash_key     = "LockID"
-
-  attribute {
-    name = "LockID"
-    type = "S"
-  }
-
-  point_in_time_recovery {
-    enabled = true
-  }
-
-  tags = {
-    Name    = "${var.project_name}-tfstate-lock"
-    Purpose = "Terraform state locking"
-  }
-}
-
-# ------------------------------------------------------------------------------
-# Outputs
-# ------------------------------------------------------------------------------
 
 output "state_bucket" {
-  value = aws_s3_bucket.tfstate.bucket
-}
-
-output "dynamodb_table" {
-  value = aws_dynamodb_table.tfstate_lock.name
+  description = "S3 bucket name — use this in backend.tf"
+  value       = aws_s3_bucket.tfstate.bucket
 }
 
 output "backend_config_snippet" {
-  description = "Paste this block into the root-level backend.tf, then run: terraform init -migrate-state"
-  value       = <<-EOT
-
-    terraform {
-      backend "s3" {
-        bucket         = "${aws_s3_bucket.tfstate.bucket}"
-        key            = "golden-path/dev/terraform.tfstate"
-        region         = "${var.aws_region}"
-        dynamodb_table = "${aws_dynamodb_table.tfstate_lock.name}"
-        encrypt        = true
-      }
-    }
-
+  description = "Copy this into your backend.tf"
+  value = <<-EOT
+bucket         = "${aws_s3_bucket.tfstate.bucket}"
+key            = "terraform.tfstate"
+region         = var.aws_region
+encrypt        = true
+use_lockfile   = true
   EOT
 }

@@ -101,7 +101,7 @@ variable "cpu_scale_target" {
 variable "app_s3_bucket_name" {
   description = "S3 bucket the app task role can access (for IRSA-equivalent)"
   type        = string
-  default     = ""  # Defaults to project-name-app-data-accountId if empty
+  default     = "" # Defaults to project-name-app-data-accountId if empty
 }
 
 # --- Secrets ------------------------------------------------------------------

@@ -1,0 +1,52 @@
+# Terraform state files (NEVER commit these)
+*.tfstate
+*.tfstate.*
+.terraform/
+*.lock.hcl
+
+# Terraform variable files with secrets (use .example files instead)
+terraform.tfvars
+terraform.tfvars.json
+*.auto.tfvars
+*.auto.tfvars.json
+
+# Terraform crash logs
+crash.log
+crash.*.log
+
+# Terraform override files (local dev overrides)
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Terraform CLI debugging
+.terraformrc
+terraform.rc
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+*.iml
+
+# OS files
+Thumbs.db
+
+# Backup and temporary files
+*.backup
+*.bak
+*.tmp
+*.log
+
+# AWS credentials and keys
+.aws/
+aws_credentials
+.env
+
+# Project logs
+apply.log
+plan.log
+destroy.log

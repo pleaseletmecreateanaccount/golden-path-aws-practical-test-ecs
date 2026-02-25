@@ -30,14 +30,14 @@ variable "tg_arn_suffix"  { type = string }
 # CloudWatch Alarms — alerting on Golden Signals
 # ------------------------------------------------------------------------------
 
-# LATENCY alarm — p95 latency > 1 second
+# LATENCY alarm — average latency > 1 second
 resource "aws_cloudwatch_metric_alarm" "latency_p95" {
   alarm_name          = "${var.name_prefix}-latency-p95-high"
-  alarm_description   = "Golden Signal: Latency — p95 response time above 1s"
+  alarm_description   = "Golden Signal: Latency — average response time above 1s"
   namespace           = "AWS/ApplicationELB"
   metric_name         = "TargetResponseTime"
   dimensions          = { LoadBalancer = var.alb_arn_suffix }
-  statistic           = "p95"
+  statistic           = "Average"
   period              = 60
   evaluation_periods  = 3
   threshold           = 1.0       # 1 second
@@ -136,7 +136,10 @@ resource "aws_cloudwatch_dashboard" "golden_signals" {
 
       {
         type   = "text"
-        x      = 0; y = 0; width = 24; height = 1
+        x      = 0
+        y      = 1
+        width  = 24
+        height = 1
         properties = {
           markdown = "# ${var.name_prefix} — The 4 Golden Signals Dashboard\n**Cluster:** `${var.ecs_cluster}` | **Service:** `${var.ecs_service}` | **Region:** `${var.region}`"
         }
@@ -147,14 +150,20 @@ resource "aws_cloudwatch_dashboard" "golden_signals" {
 
       {
         type   = "text"
-        x      = 0; y = 1; width = 24; height = 1
+        x      = 0
+        y      = 1
+        width  = 24
+        height = 1
         properties = {
           markdown = "## 🕐 Latency — How long it takes to service a request"
         }
       },
       {
         type   = "metric"
-        x      = 0; y = 2; width = 12; height = 6
+        x      = 0
+        y = 2
+        width = 12
+        height = 6
         properties = {
           title  = "ALB Response Time (p50 / p95 / p99)"
           view   = "timeSeries"
@@ -177,7 +186,10 @@ resource "aws_cloudwatch_dashboard" "golden_signals" {
       },
       {
         type   = "metric"
-        x      = 12; y = 2; width = 12; height = 6
+        x      = 12 
+        y = 2 
+        width = 12 
+        height = 6
         properties = {
           title  = "ALB Response Time Distribution"
           view   = "timeSeries"
@@ -198,14 +210,20 @@ resource "aws_cloudwatch_dashboard" "golden_signals" {
 
       {
         type   = "text"
-        x      = 0; y = 8; width = 24; height = 1
+        x      = 0 
+        y = 8 
+        width = 24
+        height = 1
         properties = {
           markdown = "## 📈 Traffic — How much demand is on your system"
         }
       },
       {
         type   = "metric"
-        x      = 0; y = 9; width = 12; height = 6
+        x      = 0 
+        y = 9 
+        width = 12
+        height = 6
         properties = {
           title  = "Request Count per Minute"
           view   = "timeSeries"
@@ -220,7 +238,10 @@ resource "aws_cloudwatch_dashboard" "golden_signals" {
       },
       {
         type   = "metric"
-        x      = 12; y = 9; width = 12; height = 6
+        x      = 12 
+        y = 9 
+        width = 12 
+        height = 6
         properties = {
           title  = "Active Connections + New Connections"
           view   = "timeSeries"
@@ -240,14 +261,20 @@ resource "aws_cloudwatch_dashboard" "golden_signals" {
 
       {
         type   = "text"
-        x      = 0; y = 15; width = 24; height = 1
+        x      = 0 
+        y = 15 
+        width = 24 
+        height = 1
         properties = {
           markdown = "## 🚨 Errors — Rate of requests that fail"
         }
       },
       {
         type   = "metric"
-        x      = 0; y = 16; width = 12; height = 6
+        x      = 0 
+        y = 16 
+        width = 12 
+        height = 6
         properties = {
           title  = "HTTP Error Responses (4xx / 5xx)"
           view   = "timeSeries"
@@ -266,7 +293,10 @@ resource "aws_cloudwatch_dashboard" "golden_signals" {
       },
       {
         type   = "metric"
-        x      = 12; y = 16; width = 12; height = 6
+        x      = 12 
+        y = 16 
+        width = 12 
+        height = 6
         properties = {
           title  = "Failed Target Health Checks"
           view   = "timeSeries"
@@ -289,14 +319,20 @@ resource "aws_cloudwatch_dashboard" "golden_signals" {
 
       {
         type   = "text"
-        x      = 0; y = 22; width = 24; height = 1
+        x      = 0 
+        y = 22 
+        width = 24 
+        height = 1
         properties = {
           markdown = "## 📊 Saturation — How full or constrained your service is"
         }
       },
       {
         type   = "metric"
-        x      = 0; y = 23; width = 12; height = 6
+        x      = 0 
+        y = 23 
+        width = 12 
+        height = 6
         properties = {
           title  = "ECS CPU Utilization %"
           view   = "timeSeries"
@@ -318,7 +354,10 @@ resource "aws_cloudwatch_dashboard" "golden_signals" {
       },
       {
         type   = "metric"
-        x      = 12; y = 23; width = 12; height = 6
+        x      = 12 
+        y = 23 
+        width = 12 
+        height = 6
         properties = {
           title  = "ECS Memory Utilization %"
           view   = "timeSeries"
@@ -343,14 +382,20 @@ resource "aws_cloudwatch_dashboard" "golden_signals" {
 
       {
         type   = "text"
-        x      = 0; y = 29; width = 24; height = 1
+        x      = 0 
+        y = 29 
+        width = 24 
+        height = 1
         properties = {
           markdown = "## ⚖️ ECS Service Health + Auto Scaling Activity"
         }
       },
       {
         type   = "metric"
-        x      = 0; y = 30; width = 12; height = 6
+        x      = 0 
+        y = 30 
+        width = 12 
+        height = 6
         properties = {
           title  = "ECS Running Task Count"
           view   = "timeSeries"
@@ -366,7 +411,10 @@ resource "aws_cloudwatch_dashboard" "golden_signals" {
       },
       {
         type   = "alarm"
-        x      = 12; y = 30; width = 12; height = 6
+        x      = 12 
+        y = 30 
+        width = 12 
+        height = 6
         properties = {
           title  = "Alarm Status — Golden Signal Alarms"
           alarms = [
