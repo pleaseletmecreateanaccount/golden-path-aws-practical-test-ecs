@@ -71,8 +71,7 @@ jobs:
             -out=tfplan \
             2>&1 | tee plan_output.txt
           echo "exitcode=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
-        working-directory: ${{ env.TF_WORK_DIR }}
-        continue-on-error: true 
+        working-directory: ${{ env.TF_WORK_DIR }} 
 
 
       - name: Post Plan to PR
