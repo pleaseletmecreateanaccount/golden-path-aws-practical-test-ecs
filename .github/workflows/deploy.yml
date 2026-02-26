@@ -1,3 +1,18 @@
+# ==============================================================================
+# GitHub Actions — "Golden Path" CI/CD Pipeline
+#
+# Trigger: Push to main branch
+# Flow:    Lint → Plan → Apply (infra) → Deploy (ECS)
+#
+# Required GitHub Secrets:
+#   AWS_ROLE_ARN      — IAM role for GitHub OIDC federation (no static keys)
+#   AWS_REGION        — e.g. ap-southeast-1
+#   TF_STATE_BUCKET   — S3 bucket name from bootstrap output
+#   TF_STATE_DYNAMODB — DynamoDB table name from bootstrap output
+#   ECS_CLUSTER_NAME  — e.g. golden-path-dev-cluster
+#   ECS_SERVICE_NAME  — e.g. golden-path-dev-hello-world-svc
+# ==============================================================================
+
 name: Golden Path — Deploy
 
 on:
@@ -5,20 +20,25 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  workflow_dispatch: 
+  workflow_dispatch:
 
+# AWS_REGION is sourced from GitHub Secrets so it is a single source of truth.
+# Every Terraform command also receives -var="aws_region=..." explicitly so
+# Terraform never silently falls back to the default in variables.tf.
 env:
-  AWS_REGION:    ap-southeast-1
-  TF_VERSION:    "1.7.5"
-  TF_WORK_DIR:   "."
+  AWS_REGION:  ${{ secrets.AWS_REGION }}
+  TF_VERSION:  "1.7.5"
+  TF_WORK_DIR: "."
 
 permissions:
-  id-token: write   
-  contents: read    
-  pull-requests: write 
+  id-token:      write
+  contents:      read
+  pull-requests: write
 
 jobs:
-
+  # ============================================================================
+  # Job 1: Terraform Plan
+  # ============================================================================
   terraform-plan:
     name: Terraform Plan
     runs-on: ubuntu-latest
@@ -32,9 +52,9 @@ jobs:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume:     ${{ secrets.AWS_ROLE_ARN }}
-          aws-region:         ${{ env.AWS_REGION }}
-          role-session-name:  GitHubActions-TerraformPlan
+          role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:        ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-TerraformPlan
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -42,24 +62,21 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
 
       - name: Terraform Format Check
-        id: fmt
         run: terraform fmt -check -recursive
         working-directory: ${{ env.TF_WORK_DIR }}
         continue-on-error: true
 
       - name: Terraform Init
-        id: init
         run: |
           terraform init \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
             -backend-config="key=golden-path/dev/terraform.tfstate" \
             -backend-config="region=${{ env.AWS_REGION }}" \
-            -backend-config="encrypt=true" \
-            -backend-config="dynamodb_table=golden-path-terraform-locks"
+            -backend-config="dynamodb_table=${{ secrets.TF_STATE_DYNAMODB }}" \
+            -backend-config="encrypt=true"
         working-directory: ${{ env.TF_WORK_DIR }}
 
       - name: Terraform Validate
-        id: validate
         run: terraform validate -no-color
         working-directory: ${{ env.TF_WORK_DIR }}
 
@@ -70,10 +87,11 @@ jobs:
             -no-color \
             -detailed-exitcode \
             -out=tfplan \
+            -var="aws_region=${{ env.AWS_REGION }}" \
             2>&1 | tee plan_output.txt
           echo "exitcode=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
-        working-directory: ${{ env.TF_WORK_DIR }} 
-
+        working-directory: ${{ env.TF_WORK_DIR }}
+        continue-on-error: true
 
       - name: Post Plan to PR
         if: github.event_name == 'pull_request'
@@ -97,15 +115,17 @@ jobs:
         with:
           name: tfplan
           path: tfplan
-          retention-days: 5
+          retention-days: 1
 
-
+  # ============================================================================
+  # Job 2: Terraform Apply (push to main only)
+  # ============================================================================
   terraform-apply:
     name: Terraform Apply
     runs-on: ubuntu-latest
     needs: terraform-plan
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    environment: production  
+    environment: production
 
     steps:
       - name: Checkout repository
@@ -129,8 +149,8 @@ jobs:
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
             -backend-config="key=golden-path/dev/terraform.tfstate" \
             -backend-config="region=${{ env.AWS_REGION }}" \
-            -backend-config="encrypt=true" \
-            -backend-config="dynamodb_table=golden-path-terraform-locks"
+            -backend-config="dynamodb_table=${{ secrets.TF_STATE_DYNAMODB }}" \
+            -backend-config="encrypt=true"
         working-directory: ${{ env.TF_WORK_DIR }}
 
       - name: Download plan artifact
@@ -138,19 +158,23 @@ jobs:
         with:
           name: tfplan
 
+      # The plan artifact already bakes in -var="aws_region=..." from the plan
+      # step above, so apply just consumes the pre-approved plan as-is.
       - name: Terraform Apply
         run: terraform apply -auto-approve tfplan
         working-directory: ${{ env.TF_WORK_DIR }}
 
-  
       - name: Export Terraform Outputs
         id: tf-outputs
         run: |
-          echo "alb_dns_name=$(terraform output -raw alb_dns_name)" >> $GITHUB_OUTPUT
-          echo "cluster_name=$(terraform output -raw cluster_name)" >> $GITHUB_OUTPUT
-          echo "service_name=$(terraform output -raw service_name)" >> $GITHUB_OUTPUT
+          echo "alb_url=$(terraform output -raw alb_url)"           >> $GITHUB_OUTPUT
+          echo "ecs_cluster=$(terraform output -raw ecs_cluster_name)" >> $GITHUB_OUTPUT
+          echo "ecs_service=$(terraform output -raw ecs_service_name)" >> $GITHUB_OUTPUT
         working-directory: ${{ env.TF_WORK_DIR }}
 
+  # ============================================================================
+  # Job 3: Force New ECS Deployment
+  # ============================================================================
   ecs-deploy:
     name: Deploy to ECS
     runs-on: ubuntu-latest
@@ -168,18 +192,16 @@ jobs:
       - name: Force new ECS deployment
         run: |
           aws ecs update-service \
-            --cluster golden-path-dev-cluster \
-            --service golden-path-dev-hello-world-svc \
+            --cluster "${{ secrets.ECS_CLUSTER_NAME }}" \
+            --service "${{ secrets.ECS_SERVICE_NAME }}" \
             --force-new-deployment \
             --region "${{ env.AWS_REGION }}"
 
-
       - name: Wait for ECS service stability
         run: |
-          echo "Waiting for ECS service to stabilize..."
           aws ecs wait services-stable \
-            --cluster golden-path-dev-cluster \
-            --services golden-path-dev-hello-world-svc \
+            --cluster "${{ secrets.ECS_CLUSTER_NAME }}" \
+            --services "${{ secrets.ECS_SERVICE_NAME }}" \
             --region "${{ env.AWS_REGION }}"
           echo "ECS service is stable!"
 
@@ -187,7 +209,7 @@ jobs:
         run: |
           echo "=========================================="
           echo "Deployment complete!"
-          echo "Cluster: golden-path-dev-cluster"
-          echo "Service:  golden-path-dev-hello-world-svc"
+          echo "Cluster: ${{ secrets.ECS_CLUSTER_NAME }}"
+          echo "Service:  ${{ secrets.ECS_SERVICE_NAME }}"
           echo "Region:   ${{ env.AWS_REGION }}"
           echo "=========================================="

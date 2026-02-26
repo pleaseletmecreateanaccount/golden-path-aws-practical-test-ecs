@@ -4,22 +4,20 @@
 # Trigger: Manual only (workflow_dispatch) — can NEVER be triggered by a push.
 #
 # Inputs:
-#   aws_region      — The region where your resources live (e.g. ap-southeast-1)
+#   target_region   — The region where the resources to DESTROY live
 #   confirm_destroy — Must type "destroy" to proceed (safety gate)
 #
-# What this destroys (in order):
-#   1. ECS Service + Tasks (drained first so ALB stops routing)
-#   2. terraform destroy  (all Terraform-managed resources)
-#   3. Secrets Manager secret (force-delete, no 7-day wait)
-#   4. CloudWatch Log Groups (not always caught by Terraform destroy)
-#   5. ECR images (if repository exists)
-#   6. S3 app data bucket (emptied then deleted)
-#   7. Bootstrap S3 state bucket (emptied then deleted — optional, see job)
+# IMPORTANT — Two regions in play:
+#   secrets.AWS_REGION  → where your STATE BUCKET lives (always ap-southeast-1)
+#   target_region input → where the RESOURCES TO DESTROY live (pick us-east-1
+#                         to clean up accidental deploys, or ap-southeast-1 for
+#                         your real environment)
 #
-# Required GitHub Secrets (same as deploy pipeline):
-#   AWS_ROLE_ARN         — OIDC-federated IAM role
-#   TF_STATE_BUCKET      — e.g. golden-path-tfstate-825566110381
-# TF_STATE_DYNAMODB    — e.g. golden-path-terraform-locks
+# Required GitHub Secrets:
+#   AWS_ROLE_ARN      — OIDC-federated IAM role
+#   AWS_REGION        — Region where your state bucket lives (ap-southeast-1)
+#   TF_STATE_BUCKET   — e.g. golden-path-tfstate-825566110381
+#   TF_STATE_DYNAMODB — e.g. golden-path-terraform-locks
 # ==============================================================================
 
 name: Golden Path — DESTROY ALL RESOURCES 💣
@@ -27,8 +25,8 @@ name: Golden Path — DESTROY ALL RESOURCES 💣
 on:
   workflow_dispatch:
     inputs:
-      aws_region:
-        description: "AWS region where your resources are deployed"
+      target_region:
+        description: "Region where the resources to DESTROY are deployed"
         required: true
         type: choice
         options:
@@ -40,12 +38,12 @@ on:
           - ap-southeast-2
 
       confirm_destroy:
-        description: 'Type "destroy" to confirm you want to delete everything'
+        description: 'Type "destroy" to confirm — this is irreversible'
         required: true
         type: string
 
       destroy_state_bucket:
-        description: "Also delete the Terraform state S3 bucket? (full clean slate)"
+        description: "Also delete the Terraform state S3 bucket? (WARNING: permanent)"
         required: true
         type: boolean
         default: false
@@ -62,14 +60,13 @@ on:
         type: string
         default: "dev"
 
-# No permissions beyond what OIDC needs — principle of least privilege
 permissions:
   id-token: write
   contents: read
 
 jobs:
   # ============================================================================
-  # Safety Gate — fail immediately if confirmation word is wrong
+  # Safety Gate
   # ============================================================================
   confirm:
     name: ✋ Safety Check
@@ -81,24 +78,26 @@ jobs:
             echo "❌ Confirmation failed."
             echo "   You typed: '${{ github.event.inputs.confirm_destroy }}'"
             echo "   Expected:  'destroy'"
-            echo ""
-            echo "Re-run this workflow and type exactly: destroy"
             exit 1
           fi
-          echo "✅ Confirmation accepted. Proceeding with destroy in region: ${{ github.event.inputs.aws_region }}"
+          echo "✅ Confirmed. Target region: ${{ github.event.inputs.target_region }}"
+          echo "   State bucket region:  ${{ secrets.AWS_REGION }}"
 
   # ============================================================================
-  # Terraform Destroy — removes all Terraform-managed infrastructure
+  # Terraform Destroy
   # ============================================================================
   terraform-destroy:
     name: 🏗️ Terraform Destroy
     runs-on: ubuntu-latest
     needs: confirm
     env:
-      AWS_REGION:   ${{ github.event.inputs.aws_region }}
-      PROJECT_NAME: ${{ github.event.inputs.project_name }}
-      ENVIRONMENT:  ${{ github.event.inputs.environment }}
-      NAME_PREFIX:  ${{ github.event.inputs.project_name }}-${{ github.event.inputs.environment }}
+      # TARGET_REGION  — where the resources being destroyed are
+      TARGET_REGION: ${{ github.event.inputs.target_region }}
+      # STATE_REGION   — where the state bucket lives (never changes)
+      STATE_REGION:  ${{ secrets.AWS_REGION }}
+      PROJECT_NAME:  ${{ github.event.inputs.project_name }}
+      ENVIRONMENT:   ${{ github.event.inputs.environment }}
+      NAME_PREFIX:   ${{ github.event.inputs.project_name }}-${{ github.event.inputs.environment }}
 
     steps:
       - name: Checkout
@@ -108,25 +107,30 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
-          aws-region:        ${{ github.event.inputs.aws_region }}
+          aws-region:        ${{ github.event.inputs.target_region }}
           role-session-name: GitHubActions-Destroy
 
+      - name: Print region summary
+        run: |
+          echo "=============================================="
+          echo "  Target region (destroying):  ${{ env.TARGET_REGION }}"
+          echo "  State bucket region:         ${{ env.STATE_REGION }}"
+          echo "  State bucket:                ${{ secrets.TF_STATE_BUCKET }}"
+          echo "=============================================="
+
       # --------------------------------------------------------------------------
-      # Step 1: Force-stop the ECS service first so tasks drain cleanly
-      # Terraform destroy can hang waiting for tasks to stop if the service
-      # is still running with a desired count > 0
+      # Scale down ECS service first so tasks drain before terraform destroy
       # --------------------------------------------------------------------------
       - name: Scale down ECS service to zero
-        continue-on-error: true   # OK if service doesn't exist
+        continue-on-error: true
         run: |
           CLUSTER="${{ env.NAME_PREFIX }}-cluster"
           SERVICE="${{ env.NAME_PREFIX }}-hello-world-svc"
 
-          echo "Checking if ECS service exists..."
           EXISTS=$(aws ecs describe-services \
             --cluster "$CLUSTER" \
             --services "$SERVICE" \
-            --region "${{ env.AWS_REGION }}" \
+            --region "${{ env.TARGET_REGION }}" \
             --query "services[?status=='ACTIVE'] | length(@)" \
             --output text 2>/dev/null || echo "0")
 
@@ -136,88 +140,78 @@ jobs:
               --cluster "$CLUSTER" \
               --service "$SERVICE" \
               --desired-count 0 \
-              --region "${{ env.AWS_REGION }}"
+              --region "${{ env.TARGET_REGION }}"
 
-            echo "Waiting for tasks to drain (up to 2 min)..."
             aws ecs wait services-stable \
               --cluster "$CLUSTER" \
               --services "$SERVICE" \
-              --region "${{ env.AWS_REGION }}" || true
+              --region "${{ env.TARGET_REGION }}" || true
             echo "✅ ECS service scaled to zero"
           else
-            echo "ECS service not found or not active — skipping scale-down"
+            echo "ECS service not found — skipping scale-down"
           fi
 
-      # --------------------------------------------------------------------------
-      # Step 2: Run terraform destroy
-      # --------------------------------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.7.5"
 
+      # --------------------------------------------------------------------------
+      # terraform init:
+      #   backend region  → STATE_REGION (where the .tfstate file lives)
+      #   -var aws_region → TARGET_REGION (tells Terraform which region to destroy)
+      # --------------------------------------------------------------------------
       - name: Terraform Init
         run: |
           terraform init \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
             -backend-config="key=${{ env.PROJECT_NAME }}/${{ env.ENVIRONMENT }}/terraform.tfstate" \
-            -backend-config="region=${{ github.event.inputs.aws_region }}" \
-            -backend-config="encrypt=true" \
-            -backend-config="dynamodb_table=${{ secrets.TF_STATE_DYNAMODB }}"
+            -backend-config="region=${{ env.STATE_REGION }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_STATE_DYNAMODB }}" \
+            -backend-config="encrypt=true"
 
       - name: Terraform Destroy
         run: |
           terraform destroy \
             -auto-approve \
-            -var="aws_region=${{ github.event.inputs.aws_region }}" \
+            -var="aws_region=${{ env.TARGET_REGION }}" \
             -var="project_name=${{ env.PROJECT_NAME }}" \
             -var="environment=${{ env.ENVIRONMENT }}"
 
   # ============================================================================
   # Cleanup Leftover Resources
-  # Some resources are not managed by Terraform, or Terraform destroy misses
-  # them due to dependency ordering. This job catches all of them.
+  # Catches anything terraform destroy misses
   # ============================================================================
   cleanup-leftovers:
     name: 🧹 Clean Up Leftover Resources
     runs-on: ubuntu-latest
-    needs: terraform-destroy   # Run even if terraform destroy partially failed
+    needs: terraform-destroy
     if: always()
     env:
-      AWS_REGION:   ${{ github.event.inputs.aws_region }}
-      PROJECT_NAME: ${{ github.event.inputs.project_name }}
-      ENVIRONMENT:  ${{ github.event.inputs.environment }}
-      NAME_PREFIX:  ${{ github.event.inputs.project_name }}-${{ github.event.inputs.environment }}
+      TARGET_REGION: ${{ github.event.inputs.target_region }}
+      NAME_PREFIX:   ${{ github.event.inputs.project_name }}-${{ github.event.inputs.environment }}
+      PROJECT_NAME:  ${{ github.event.inputs.project_name }}
+      ENVIRONMENT:   ${{ github.event.inputs.environment }}
 
     steps:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
-          aws-region:        ${{ github.event.inputs.aws_region }}
+          aws-region:        ${{ github.event.inputs.target_region }}
           role-session-name: GitHubActions-Cleanup
 
-      # --------------------------------------------------------------------------
-      # Secrets Manager — force-delete skips the 7-day recovery window
-      # Without this you'd be billed for the secret for 7 more days and
-      # can't reuse the same secret name immediately
-      # --------------------------------------------------------------------------
       - name: Force-delete Secrets Manager secret
         continue-on-error: true
         run: |
           SECRET_NAME="${{ env.PROJECT_NAME }}/${{ env.ENVIRONMENT }}/db-password"
-          echo "Force-deleting secret: $SECRET_NAME"
           aws secretsmanager delete-secret \
             --secret-id "$SECRET_NAME" \
             --force-delete-without-recovery \
-            --region "${{ env.AWS_REGION }}" 2>/dev/null \
+            --region "${{ env.TARGET_REGION }}" 2>/dev/null \
             && echo "✅ Secret deleted" \
             || echo "⚠️  Secret not found or already deleted"
 
-      # --------------------------------------------------------------------------
-      # CloudWatch Log Groups — Terraform sometimes misses these if the
-      # ECS service is deleted before the log group retention policy is applied
-      # --------------------------------------------------------------------------
       - name: Delete CloudWatch Log Groups
         continue-on-error: true
         run: |
@@ -226,84 +220,57 @@ jobs:
             "/aws/ecs/containerinsights/${{ env.NAME_PREFIX }}-cluster/performance"
           )
           for LG in "${LOG_GROUPS[@]}"; do
-            echo "Deleting log group: $LG"
             aws logs delete-log-group \
               --log-group-name "$LG" \
-              --region "${{ env.AWS_REGION }}" 2>/dev/null \
-              && echo "  ✅ Deleted $LG" \
-              || echo "  ⚠️  Not found: $LG"
+              --region "${{ env.TARGET_REGION }}" 2>/dev/null \
+              && echo "✅ Deleted $LG" \
+              || echo "⚠️  Not found: $LG"
           done
 
-      # --------------------------------------------------------------------------
-      # ECR — delete all images in the repository
-      # Images have no free-tier limit after 500MB — delete to stop storage costs
-      # --------------------------------------------------------------------------
-      - name: Delete ECR images
+      - name: Delete ECR images and repository
         continue-on-error: true
         run: |
           REPO="${{ env.NAME_PREFIX }}-hello-world"
-          echo "Checking ECR repository: $REPO"
-
-          # Check if repo exists
           aws ecr describe-repositories \
             --repository-names "$REPO" \
-            --region "${{ env.AWS_REGION }}" 2>/dev/null || {
-            echo "⚠️  ECR repository not found — skipping"
-            exit 0
-          }
+            --region "${{ env.TARGET_REGION }}" 2>/dev/null || { echo "⚠️  ECR repo not found"; exit 0; }
 
-          # Get all image IDs
           IMAGE_IDS=$(aws ecr list-images \
             --repository-name "$REPO" \
-            --region "${{ env.AWS_REGION }}" \
+            --region "${{ env.TARGET_REGION }}" \
             --query "imageIds[*]" \
             --output json)
 
-          if [ "$IMAGE_IDS" = "[]" ]; then
-            echo "⚠️  No images found in repository"
-          else
-            echo "Deleting all images in $REPO..."
+          if [ "$IMAGE_IDS" != "[]" ]; then
             aws ecr batch-delete-image \
               --repository-name "$REPO" \
               --image-ids "$IMAGE_IDS" \
-              --region "${{ env.AWS_REGION }}"
-            echo "✅ ECR images deleted"
+              --region "${{ env.TARGET_REGION }}"
           fi
 
-          # Delete the repository itself
           aws ecr delete-repository \
             --repository-name "$REPO" \
             --force \
-            --region "${{ env.AWS_REGION }}" 2>/dev/null \
+            --region "${{ env.TARGET_REGION }}" 2>/dev/null \
             && echo "✅ ECR repository deleted" \
             || echo "⚠️  ECR repository not found"
 
-      # --------------------------------------------------------------------------
-      # S3 App Data Bucket — must be emptied before Terraform can delete it
-      # If Terraform destroy failed before this, the bucket may still exist
-      # --------------------------------------------------------------------------
       - name: Empty and delete app data S3 bucket
         continue-on-error: true
         run: |
-          # Fetch account ID to reconstruct bucket name
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           BUCKET="${{ env.NAME_PREFIX }}-app-data-${ACCOUNT_ID}"
 
-          echo "Checking bucket: $BUCKET"
-          aws s3api head-bucket --bucket "$BUCKET" --region "${{ env.AWS_REGION }}" 2>/dev/null || {
-            echo "⚠️  Bucket not found — skipping"
-            exit 0
-          }
+          aws s3api head-bucket --bucket "$BUCKET" \
+            --region "${{ env.TARGET_REGION }}" 2>/dev/null || { echo "⚠️  Bucket not found"; exit 0; }
 
-          echo "Emptying bucket (including all versions)..."
-          # Delete all object versions (needed when versioning is enabled)
+          # Delete all versioned objects
           aws s3api list-object-versions \
             --bucket "$BUCKET" \
-            --region "${{ env.AWS_REGION }}" \
+            --region "${{ env.TARGET_REGION }}" \
             --output json \
             --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
-            2>/dev/null | \
-          python3 -c "
+          2>/dev/null | python3 -c "
           import sys, json, subprocess
           data = json.load(sys.stdin)
           objects = data.get('Objects') or []
@@ -311,109 +278,68 @@ jobs:
               payload = json.dumps({'Objects': objects, 'Quiet': True})
               subprocess.run(['aws', 's3api', 'delete-objects',
                               '--bucket', '$BUCKET',
-                              '--region', '${{ env.AWS_REGION }}',
+                              '--region', '${{ env.TARGET_REGION }}',
                               '--delete', payload], check=True)
-              print(f'  Deleted {len(objects)} object versions')
-          else:
-              print('  No versioned objects found')
+              print(f'Deleted {len(objects)} versions')
           " 2>/dev/null || true
 
-          # Also delete any delete markers
           aws s3 rm "s3://$BUCKET" --recursive \
-            --region "${{ env.AWS_REGION }}" 2>/dev/null || true
+            --region "${{ env.TARGET_REGION }}" 2>/dev/null || true
 
-          # Now delete the bucket
           aws s3api delete-bucket \
             --bucket "$BUCKET" \
-            --region "${{ env.AWS_REGION }}" \
+            --region "${{ env.TARGET_REGION }}" \
             && echo "✅ App data bucket deleted" \
             || echo "⚠️  Could not delete bucket"
 
-      # --------------------------------------------------------------------------
-      # VPC Cleanup — sometimes ENIs from VPC endpoints or ALBs linger
-      # and prevent VPC deletion even after terraform destroy
-      # --------------------------------------------------------------------------
-      - name: Clean up lingering VPC resources
+      - name: Release lingering NAT Gateway EIPs
         continue-on-error: true
         run: |
-          # Find VPC by name tag
-          VPC_ID=$(aws ec2 describe-vpcs \
-            --filters "Name=tag:Name,Values=${{ env.NAME_PREFIX }}-vpc" \
-            --region "${{ env.AWS_REGION }}" \
-            --query "Vpcs[0].VpcId" \
-            --output text 2>/dev/null)
-
-          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
-            echo "✅ No lingering VPC found — already cleaned up"
-            exit 0
-          fi
-
-          echo "Found lingering VPC: $VPC_ID — cleaning up ENIs..."
-
-          # Release any unattached Elastic IPs (NAT Gateway EIPs)
           EIP_ALLOCS=$(aws ec2 describe-addresses \
             --filters "Name=tag:Name,Values=${{ env.NAME_PREFIX }}-nat-eip" \
-            --region "${{ env.AWS_REGION }}" \
+            --region "${{ env.TARGET_REGION }}" \
             --query "Addresses[*].AllocationId" \
             --output text 2>/dev/null)
 
           for ALLOC in $EIP_ALLOCS; do
-            echo "  Releasing EIP: $ALLOC"
             aws ec2 release-address \
               --allocation-id "$ALLOC" \
-              --region "${{ env.AWS_REGION }}" 2>/dev/null \
-              && echo "  ✅ Released $ALLOC" || true
+              --region "${{ env.TARGET_REGION }}" \
+              && echo "✅ Released EIP: $ALLOC" || true
           done
 
-          echo "⚠️  VPC $VPC_ID may still exist if ENIs are still attached."
-          echo "    Check the AWS console under VPC → Your VPCs if terraform destroy didn't finish."
-
-      # --------------------------------------------------------------------------
-      # Summary
-      # --------------------------------------------------------------------------
       - name: Print destroy summary
         if: always()
         run: |
           echo "=============================================="
           echo "  DESTROY SUMMARY"
+          echo "  Target region:  ${{ env.TARGET_REGION }}"
+          echo "  Project:        ${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}"
+          echo "  Triggered by:   ${{ github.actor }}"
+          echo "  Time:           $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           echo "=============================================="
-          echo "  Region:      ${{ github.event.inputs.aws_region }}"
-          echo "  Project:     ${{ github.event.inputs.project_name }}"
-          echo "  Environment: ${{ github.event.inputs.environment }}"
-          echo "  Triggered by: ${{ github.actor }}"
-          echo "  Time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          echo ""
-          echo "  Resources targeted for deletion:"
-          echo "  ✓ All Terraform-managed resources (ECS, ALB, VPC, IAM, etc.)"
-          echo "  ✓ Secrets Manager secret (force-deleted)"
-          echo "  ✓ CloudWatch Log Groups"
-          echo "  ✓ ECR repository + all images"
-          echo "  ✓ App data S3 bucket"
-          echo "  ✓ NAT Gateway Elastic IPs"
-          echo ""
-          echo "  Verify in AWS Console → Region: ${{ github.event.inputs.aws_region }}"
+          echo "  Verify cleanup in AWS Console:"
+          echo "  https://console.aws.amazon.com/vpc/home?region=${{ env.TARGET_REGION }}"
           echo "=============================================="
 
   # ============================================================================
-  # Optional: Delete the Terraform State Bucket (full clean slate)
-  # Only runs if "destroy_state_bucket" input is true.
-  # WARNING: After this, Terraform has no memory of any resources.
-  #          Only do this when you are 100% done with the project.
+  # Optional: Delete the Terraform State Bucket
+  # Only runs if destroy_state_bucket checkbox is checked
   # ============================================================================
   destroy-state-bucket:
-    name: ☢️ Delete State Bucket (Full Clean Slate)
+    name: ☢️ Delete State Bucket
     runs-on: ubuntu-latest
     needs: cleanup-leftovers
     if: ${{ github.event.inputs.destroy_state_bucket == 'true' }}
     env:
-      AWS_REGION: ${{ github.event.inputs.aws_region }}
+      STATE_REGION: ${{ secrets.AWS_REGION }}
 
     steps:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
-          aws-region:        ${{ github.event.inputs.aws_region }}
+          aws-region:        ${{ secrets.AWS_REGION }}
           role-session-name: GitHubActions-DestroyStateBucket
 
       - name: Empty and delete Terraform state bucket
@@ -421,21 +347,17 @@ jobs:
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           BUCKET="${{ github.event.inputs.project_name }}-tfstate-${ACCOUNT_ID}"
 
-          echo "⚠️  Deleting state bucket: $BUCKET"
-          echo "    After this, Terraform will have no record of any resources."
+          echo "⚠️  Deleting state bucket: $BUCKET (region: ${{ env.STATE_REGION }})"
 
-          # Check it exists
           aws s3api head-bucket --bucket "$BUCKET" \
-            --region "${{ env.AWS_REGION }}" 2>/dev/null || {
+            --region "${{ env.STATE_REGION }}" 2>/dev/null || {
             echo "Bucket not found — already deleted"
             exit 0
           }
 
-          # Delete all versions (bucket has versioning enabled)
-          echo "Removing all object versions..."
           aws s3api list-object-versions \
             --bucket "$BUCKET" \
-            --region "${{ env.AWS_REGION }}" \
+            --region "${{ env.STATE_REGION }}" \
             --output json \
             --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
           | python3 -c "
@@ -446,23 +368,16 @@ jobs:
               payload = json.dumps({'Objects': objects, 'Quiet': True})
               subprocess.run(['aws', 's3api', 'delete-objects',
                               '--bucket', '$BUCKET',
-                              '--region', '${{ env.AWS_REGION }}',
+                              '--region', '${{ env.STATE_REGION }}',
                               '--delete', payload], check=True)
               print(f'Deleted {len(objects)} state file versions')
-          else:
-              print('No versioned objects to delete')
           "
 
-          # Remove any remaining objects
-          aws s3 rm "s3://$BUCKET" \
-            --recursive \
-            --region "${{ env.AWS_REGION }}" 2>/dev/null || true
+          aws s3 rm "s3://$BUCKET" --recursive \
+            --region "${{ env.STATE_REGION }}" 2>/dev/null || true
 
-          # Now we can delete the bucket
-          # NOTE: prevent_destroy lifecycle is only enforced by Terraform CLI,
-          # not by AWS itself — so we can delete it via AWS CLI directly
           aws s3api delete-bucket \
             --bucket "$BUCKET" \
-            --region "${{ env.AWS_REGION }}" \
-            && echo "✅ State bucket deleted: $BUCKET" \
-            || echo "❌ Failed to delete state bucket — check AWS console"
+            --region "${{ env.STATE_REGION }}" \
+            && echo "✅ State bucket deleted" \
+            || echo "❌ Failed to delete state bucket"
