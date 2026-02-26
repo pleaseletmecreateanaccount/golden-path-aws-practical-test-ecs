@@ -1,19 +1,20 @@
 # ==============================================================================
-# GitHub Actions — "Golden Path" CI/CD Pipeline
+# GitHub Actions -- "Golden Path" CI/CD Pipeline
 #
 # Trigger: Push to main branch
-# Flow:    Lint → Plan → Apply (infra) → Deploy (ECS)
+# Flow:    Lint -> Plan -> Apply (infra) -> Deploy (ECS)
 #
 # Required GitHub Secrets:
-#   AWS_ROLE_ARN      — IAM role for GitHub OIDC federation (no static keys)
-#   AWS_REGION        — e.g. ap-southeast-1
-#   TF_STATE_BUCKET   — S3 bucket name from bootstrap output
-#   TF_STATE_DYNAMODB — DynamoDB table name from bootstrap output
-#   ECS_CLUSTER_NAME  — e.g. golden-path-dev-cluster
-#   ECS_SERVICE_NAME  — e.g. golden-path-dev-hello-world-svc
+#   AWS_ROLE_ARN      -- IAM role for GitHub OIDC federation (no static keys)
+#   AWS_REGION        -- e.g. ap-southeast-1
+#   TF_STATE_BUCKET   -- S3 bucket name from bootstrap output
+#   TF_STATE_DYNAMODB -- DynamoDB table name from bootstrap output
+#
+# ECS_CLUSTER_NAME and ECS_SERVICE_NAME are derived from project variables
+# below -- no secrets needed. Update PROJECT_NAME / ENVIRONMENT if you rename.
 # ==============================================================================
 
-name: Golden Path — Deploy
+name: Golden Path -- Deploy
 
 on:
   push:
@@ -22,13 +23,15 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# AWS_REGION is sourced from GitHub Secrets so it is a single source of truth.
-# Every Terraform command also receives -var="aws_region=..." explicitly so
-# Terraform never silently falls back to the default in variables.tf.
 env:
-  AWS_REGION:  ${{ secrets.AWS_REGION }}
-  TF_VERSION:  "1.7.5"
-  TF_WORK_DIR: "."
+  AWS_REGION:       ${{ secrets.AWS_REGION }}
+  TF_VERSION:       "1.7.5"
+  TF_WORK_DIR:      "."
+  PROJECT_NAME:     "golden-path"
+  ENVIRONMENT:      "dev"
+  # Derived from project naming convention -- matches modules/ecs/main.tf
+  ECS_CLUSTER_NAME: "golden-path-dev-cluster"
+  ECS_SERVICE_NAME: "golden-path-dev-hello-world-svc"
 
 permissions:
   id-token:      write
@@ -70,7 +73,7 @@ jobs:
         run: |
           terraform init \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="key=golden-path/dev/terraform.tfstate" \
+            -backend-config="key=${{ env.PROJECT_NAME }}/${{ env.ENVIRONMENT }}/terraform.tfstate" \
             -backend-config="region=${{ env.AWS_REGION }}" \
             -backend-config="dynamodb_table=${{ secrets.TF_STATE_DYNAMODB }}" \
             -backend-config="encrypt=true"
@@ -147,7 +150,7 @@ jobs:
         run: |
           terraform init \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="key=golden-path/dev/terraform.tfstate" \
+            -backend-config="key=${{ env.PROJECT_NAME }}/${{ env.ENVIRONMENT }}/terraform.tfstate" \
             -backend-config="region=${{ env.AWS_REGION }}" \
             -backend-config="dynamodb_table=${{ secrets.TF_STATE_DYNAMODB }}" \
             -backend-config="encrypt=true"
@@ -158,8 +161,6 @@ jobs:
         with:
           name: tfplan
 
-      # The plan artifact already bakes in -var="aws_region=..." from the plan
-      # step above, so apply just consumes the pre-approved plan as-is.
       - name: Terraform Apply
         run: terraform apply -auto-approve tfplan
         working-directory: ${{ env.TF_WORK_DIR }}
@@ -167,7 +168,7 @@ jobs:
       - name: Export Terraform Outputs
         id: tf-outputs
         run: |
-          echo "alb_url=$(terraform output -raw alb_url)"           >> $GITHUB_OUTPUT
+          echo "alb_url=$(terraform output -raw alb_url)"              >> $GITHUB_OUTPUT
           echo "ecs_cluster=$(terraform output -raw ecs_cluster_name)" >> $GITHUB_OUTPUT
           echo "ecs_service=$(terraform output -raw ecs_service_name)" >> $GITHUB_OUTPUT
         working-directory: ${{ env.TF_WORK_DIR }}
@@ -191,17 +192,21 @@ jobs:
 
       - name: Force new ECS deployment
         run: |
+          echo "Cluster: ${{ env.ECS_CLUSTER_NAME }}"
+          echo "Service: ${{ env.ECS_SERVICE_NAME }}"
+          echo "Region:  ${{ env.AWS_REGION }}"
+
           aws ecs update-service \
-            --cluster "${{ secrets.ECS_CLUSTER_NAME }}" \
-            --service "${{ secrets.ECS_SERVICE_NAME }}" \
+            --cluster "${{ env.ECS_CLUSTER_NAME }}" \
+            --service "${{ env.ECS_SERVICE_NAME }}" \
             --force-new-deployment \
             --region "${{ env.AWS_REGION }}"
 
       - name: Wait for ECS service stability
         run: |
           aws ecs wait services-stable \
-            --cluster "${{ secrets.ECS_CLUSTER_NAME }}" \
-            --services "${{ secrets.ECS_SERVICE_NAME }}" \
+            --cluster "${{ env.ECS_CLUSTER_NAME }}" \
+            --services "${{ env.ECS_SERVICE_NAME }}" \
             --region "${{ env.AWS_REGION }}"
           echo "ECS service is stable!"
 
@@ -209,7 +214,7 @@ jobs:
         run: |
           echo "=========================================="
           echo "Deployment complete!"
-          echo "Cluster: ${{ secrets.ECS_CLUSTER_NAME }}"
-          echo "Service:  ${{ secrets.ECS_SERVICE_NAME }}"
-          echo "Region:   ${{ env.AWS_REGION }}"
+          echo "Cluster: ${{ env.ECS_CLUSTER_NAME }}"
+          echo "Service: ${{ env.ECS_SERVICE_NAME }}"
+          echo "Region:  ${{ env.AWS_REGION }}"
           echo "=========================================="
