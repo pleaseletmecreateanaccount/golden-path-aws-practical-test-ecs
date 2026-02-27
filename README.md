@@ -1,9 +1,10 @@
-# 🚀 Golden Path — ECS Fargate Platform
+#  Golden Path — ECS Fargate Platform
 
 A complete "Golden Path" for deploying microservices to AWS using ECS Fargate.
 Covers all requirements: networking, compute, security, secrets, CI/CD, auto scaling, and observability.
 
 ---
+![Golden Path ECS High Level Architecture](golden-path-architecture.png)
 
 ## Architecture Overview
 
