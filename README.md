@@ -150,7 +150,7 @@ terraform output cloudwatch_dashboard_url
 
 For a purely AWS workload, ECS Fargate gives you the same core capabilities (auto scaling, load balancing, service discovery, secret injection, IAM roles) without the EKS control plane cost or operational complexity.
 
-### Spot + On-Demand Fallback (Senior Requirement)
+### Spot + On-Demand Fallback
 
 The ECS service uses a **mixed capacity provider strategy**:
 
@@ -174,7 +174,7 @@ ECS automatically handles Spot interruption by replacing terminated tasks. The `
 
 **Kubernetes equivalent:** Node groups with mixed instance policy (Spot + OD) + Cluster Autoscaler.
 
-### ECS Task Role = IRSA Equivalent (Senior Requirement)
+### ECS Task Role = IRSA Equivalent 
 
 | Kubernetes IRSA | ECS Task Role |
 |---|---|
@@ -186,7 +186,7 @@ ECS automatically handles Spot interruption by replacing terminated tasks. The `
 
 The app running inside the ECS container calls S3 using standard AWS SDK with **zero configuration** — credentials are automatically provided by the ECS task metadata endpoint and rotated by AWS every few hours.
 
-### Secret Injection (Senior Requirement)
+### Secret Injection
 
 The ECS-native approach replaces External Secrets Operator or the Secrets Store CSI Driver:
 
