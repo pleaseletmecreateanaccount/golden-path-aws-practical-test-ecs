@@ -1,25 +1,25 @@
 # ==============================================================================
-# destroy.yml — Tear Down All Golden Path Infrastructure
+# destroy.yml -- Tear Down All Golden Path Infrastructure
 #
 # Trigger: Manual only (workflow_dispatch)
 #
 # Two destroy modes depending on the target_region input:
 #
-#   target_region == secrets.AWS_REGION (e.g. ap-southeast-1)
-#     → Uses terraform destroy (resources are tracked in state)
+#   mode = "terraform"  -- target_region matches secrets.AWS_REGION
+#     Uses terraform destroy (resources are tracked in state)
 #
-#   target_region != secrets.AWS_REGION (e.g. us-east-1 accidental deploy)
-#     → Skips Terraform entirely, deletes resources directly via AWS CLI
-#       because those resources were never written to the state file
+#   mode = "direct"     -- target_region differs from secrets.AWS_REGION
+#     Skips Terraform, deletes resources directly via AWS CLI
+#     because orphaned resources were never written to the state file
 #
 # Required GitHub Secrets:
-#   AWS_ROLE_ARN      — OIDC-federated IAM role
-#   AWS_REGION        — Region where your state bucket AND real infra live
-#   TF_STATE_BUCKET   — e.g. golden-path-tfstate-825566110381
-#   TF_STATE_DYNAMODB — e.g. golden-path-terraform-locks
+#   AWS_ROLE_ARN      -- OIDC-federated IAM role
+#   AWS_REGION        -- Region where your state bucket AND real infra live
+#   TF_STATE_BUCKET   -- e.g. golden-path-tfstate-825566110381
+#   TF_STATE_DYNAMODB -- e.g. golden-path-terraform-locks
 # ==============================================================================
 
-name: Golden Path — DESTROY ALL RESOURCES 💣
+name: Golden Path -- DESTROY ALL RESOURCES
 
 on:
   workflow_dispatch:
@@ -37,7 +37,7 @@ on:
           - ap-southeast-2
 
       confirm_destroy:
-        description: 'Type "destroy" to confirm — this is irreversible'
+        description: 'Type "destroy" to confirm -- this is irreversible'
         required: true
         type: string
 
@@ -65,45 +65,58 @@ permissions:
 
 jobs:
   # ============================================================================
-  # Safety Gate
+  # Safety Gate + Mode Detection
+  # Outputs "mode" so downstream jobs can branch without using secrets in if:
+  # GitHub Actions does not allow secrets context inside job-level if conditions.
+  # The workaround is to resolve the comparison here and pass it as an output.
   # ============================================================================
   confirm:
-    name: ✋ Safety Check
+    name: Safety Check + Mode Detection
     runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.detect.outputs.mode }}
+
     steps:
       - name: Verify confirmation input
         run: |
           if [ "${{ github.event.inputs.confirm_destroy }}" != "destroy" ]; then
-            echo " Confirmation failed. You typed: '${{ github.event.inputs.confirm_destroy }}'"
+            echo "Confirmation failed. You typed: '${{ github.event.inputs.confirm_destroy }}'"
+            echo "Re-run and type exactly: destroy"
             exit 1
           fi
+          echo "Confirmation accepted."
 
+      - name: Detect destroy mode
+        id: detect
+        run: |
           TARGET="${{ github.event.inputs.target_region }}"
           STATE="${{ secrets.AWS_REGION }}"
 
-          echo " Confirmation accepted"
-          echo ""
-          echo "  Target region (deleting from): $TARGET"
-          echo "  State bucket region:           $STATE"
-          echo ""
           if [ "$TARGET" = "$STATE" ]; then
-            echo "  Mode: TERRAFORM DESTROY (resources tracked in state)"
+            echo "mode=terraform" >> $GITHUB_OUTPUT
+            echo ""
+            echo "Mode: TERRAFORM DESTROY"
+            echo "  Target region: $TARGET"
+            echo "  State region:  $STATE"
+            echo "  Resources are tracked in state -- Terraform will destroy them."
           else
-            echo "  Mode: DIRECT AWS CLI DELETE (orphaned resources, not in state)"
-            echo "  Terraform will be skipped — these resources have no state entry."
+            echo "mode=direct" >> $GITHUB_OUTPUT
+            echo ""
+            echo "Mode: DIRECT AWS CLI DELETE"
+            echo "  Target region: $TARGET"
+            echo "  State region:  $STATE"
+            echo "  Orphaned resources (not in state) -- AWS CLI will delete them."
           fi
 
   # ============================================================================
   # Job A: Terraform Destroy
-  # Only runs when target_region matches the state bucket region.
-  # These are resources Terraform knows about and can destroy cleanly.
+  # Runs when target_region == secrets.AWS_REGION (mode = terraform)
   # ============================================================================
   terraform-destroy:
-    name: 🏗️ Terraform Destroy (state-tracked resources)
+    name: Terraform Destroy (state-tracked resources)
     runs-on: ubuntu-latest
     needs: confirm
-    # Only run terraform destroy when targeting the region that has state
-    if: github.event.inputs.target_region == secrets.AWS_REGION
+    if: needs.confirm.outputs.mode == 'terraform'
     env:
       TARGET_REGION: ${{ github.event.inputs.target_region }}
       STATE_REGION:  ${{ secrets.AWS_REGION }}
@@ -127,11 +140,12 @@ jobs:
         run: |
           CLUSTER="${{ env.NAME_PREFIX }}-cluster"
           SERVICE="${{ env.NAME_PREFIX }}-hello-world-svc"
+          R="${{ env.TARGET_REGION }}"
 
           EXISTS=$(aws ecs describe-services \
             --cluster "$CLUSTER" \
             --services "$SERVICE" \
-            --region "${{ env.TARGET_REGION }}" \
+            --region "$R" \
             --query "services[?status=='ACTIVE'] | length(@)" \
             --output text 2>/dev/null || echo "0")
 
@@ -141,20 +155,21 @@ jobs:
               --cluster "$CLUSTER" \
               --service "$SERVICE" \
               --desired-count 0 \
-              --region "${{ env.TARGET_REGION }}"
+              --region "$R"
             aws ecs wait services-stable \
               --cluster "$CLUSTER" \
               --services "$SERVICE" \
-              --region "${{ env.TARGET_REGION }}" || true
-            echo "✅ Scaled to zero"
+              --region "$R" || true
+            echo "Scaled to zero"
           else
-            echo "Service not found — skipping"
+            echo "Service not found -- skipping"
           fi
 
       - name: Pre-destroy -- delete NAT Gateways and release EIPs
         continue-on-error: true
         run: |
           R="${{ env.TARGET_REGION }}"
+
           VPC_ID=$(aws ec2 describe-vpcs \
             --filters "Name=tag:Name,Values=${{ env.NAME_PREFIX }}-vpc" \
             --region "$R" \
@@ -195,7 +210,7 @@ jobs:
             done
           fi
 
-          # Disassociate any still-mapped EIPs (this is what causes IGW detach to fail)
+          # Disassociate any still-mapped EIPs (causes IGW detach to fail)
           echo "Disassociating mapped EIPs..."
           ASSOC_IDS=$(aws ec2 describe-addresses \
             --filters "Name=domain,Values=vpc" \
@@ -210,7 +225,7 @@ jobs:
               && echo "  Disassociated: $ASSOC" || true
           done
 
-          # Release all unassociated EIPs so they stop billing
+          # Release all unassociated EIPs
           echo "Releasing unassociated EIPs..."
           EIP_ALLOCS=$(aws ec2 describe-addresses \
             --filters "Name=domain,Values=vpc" \
@@ -251,17 +266,15 @@ jobs:
 
   # ============================================================================
   # Job B: Direct AWS CLI Delete
-  # Runs when target_region DIFFERS from the state bucket region.
-  # These are orphaned resources that were never written to Terraform state
-  # (e.g. a failed deploy in the wrong region). Terraform cannot see them,
-  # so we delete them resource-by-resource using the AWS CLI directly.
+  # Runs when target_region != secrets.AWS_REGION (mode = direct)
+  # Orphaned resources were never written to Terraform state so Terraform
+  # cannot see them -- delete each resource type directly via AWS CLI.
   # ============================================================================
   direct-delete:
-    name: 🗑️ Direct AWS CLI Delete (orphaned resources)
+    name: Direct AWS CLI Delete (orphaned resources)
     runs-on: ubuntu-latest
     needs: confirm
-    # Only run direct delete when targeting a DIFFERENT region than state
-    if: github.event.inputs.target_region != secrets.AWS_REGION
+    if: needs.confirm.outputs.mode == 'direct'
     env:
       TARGET_REGION: ${{ github.event.inputs.target_region }}
       NAME_PREFIX:   ${{ github.event.inputs.project_name }}-${{ github.event.inputs.environment }}
@@ -276,119 +289,70 @@ jobs:
           aws-region:        ${{ env.TARGET_REGION }}
           role-session-name: GitHubActions-DirectDelete
 
-      - name: "1. ECS — scale to zero + delete service + delete cluster"
+      - name: "1. ECS -- scale to zero, delete service, delete cluster"
         continue-on-error: true
         run: |
           CLUSTER="${{ env.NAME_PREFIX }}-cluster"
           SERVICE="${{ env.NAME_PREFIX }}-hello-world-svc"
           R="${{ env.TARGET_REGION }}"
 
-          echo "=== ECS Service ==="
           EXISTS=$(aws ecs describe-services \
             --cluster "$CLUSTER" --services "$SERVICE" --region "$R" \
             --query "services[?status=='ACTIVE'] | length(@)" \
             --output text 2>/dev/null || echo "0")
 
           if [ "$EXISTS" = "1" ]; then
-            echo "Scaling to 0..."
             aws ecs update-service \
               --cluster "$CLUSTER" --service "$SERVICE" \
               --desired-count 0 --region "$R"
             aws ecs wait services-stable \
               --cluster "$CLUSTER" --services "$SERVICE" --region "$R" || true
-
-            echo "Deleting service..."
             aws ecs delete-service \
               --cluster "$CLUSTER" --service "$SERVICE" \
               --force --region "$R" \
-              && echo "✅ Service deleted" || echo "⚠️ Service not found"
+              && echo "Service deleted" || echo "Service not found"
           fi
 
-          echo "=== ECS Cluster ==="
           aws ecs delete-cluster --cluster "$CLUSTER" --region "$R" \
-            && echo "✅ Cluster deleted" || echo "⚠️ Cluster not found"
+            && echo "Cluster deleted" || echo "Cluster not found"
 
-      - name: "2. ALB — delete listener, target group, load balancer"
+      - name: "2. ALB -- delete listeners, load balancer, target group"
         continue-on-error: true
         run: |
           R="${{ env.TARGET_REGION }}"
-          ALB_NAME="${{ env.NAME_PREFIX }}-alb"
-          TG_NAME="${{ env.NAME_PREFIX }}-tg"
 
-          echo "=== ALB ==="
           ALB_ARN=$(aws elbv2 describe-load-balancers \
-            --names "$ALB_NAME" --region "$R" \
+            --names "${{ env.NAME_PREFIX }}-alb" --region "$R" \
             --query "LoadBalancers[0].LoadBalancerArn" \
             --output text 2>/dev/null || echo "")
 
           if [ -n "$ALB_ARN" ] && [ "$ALB_ARN" != "None" ]; then
-            # Delete listeners first
-            LISTENER_ARNS=$(aws elbv2 describe-listeners \
+            LISTENERS=$(aws elbv2 describe-listeners \
               --load-balancer-arn "$ALB_ARN" --region "$R" \
               --query "Listeners[*].ListenerArn" --output text 2>/dev/null)
-            for L in $LISTENER_ARNS; do
+            for L in $LISTENERS; do
               aws elbv2 delete-listener --listener-arn "$L" --region "$R"
             done
-
             aws elbv2 delete-load-balancer \
               --load-balancer-arn "$ALB_ARN" --region "$R" \
-              && echo "✅ ALB deleted" || echo "⚠️ ALB delete failed"
-
-            # Wait for ALB to be fully gone before deleting TG
-            echo "Waiting for ALB deletion..."
+              && echo "ALB deleted"
             sleep 15
           else
-            echo "⚠️ ALB not found"
+            echo "ALB not found"
           fi
 
-          echo "=== Target Group ==="
           TG_ARN=$(aws elbv2 describe-target-groups \
-            --names "$TG_NAME" --region "$R" \
+            --names "${{ env.NAME_PREFIX }}-tg" --region "$R" \
             --query "TargetGroups[0].TargetGroupArn" \
             --output text 2>/dev/null || echo "")
 
           if [ -n "$TG_ARN" ] && [ "$TG_ARN" != "None" ]; then
             aws elbv2 delete-target-group \
               --target-group-arn "$TG_ARN" --region "$R" \
-              && echo "✅ Target group deleted" || echo "⚠️ TG delete failed"
-          else
-            echo "⚠️ Target group not found"
+              && echo "Target group deleted"
           fi
 
-      - name: "3. NAT Gateway + EIP (these cost money every hour)"
-        continue-on-error: true
-        run: |
-          R="${{ env.TARGET_REGION }}"
-
-          echo "=== NAT Gateway ==="
-          NAT_IDS=$(aws ec2 describe-nat-gateways \
-            --filter "Name=tag:Name,Values=${{ env.NAME_PREFIX }}-nat-gw" \
-                     "Name=state,Values=available,pending" \
-            --region "$R" \
-            --query "NatGateways[*].NatGatewayId" \
-            --output text 2>/dev/null)
-
-          for NAT in $NAT_IDS; do
-            echo "Deleting NAT Gateway: $NAT"
-            aws ec2 delete-nat-gateway --nat-gateway-id "$NAT" --region "$R"
-            echo "Waiting for NAT Gateway deletion..."
-            aws ec2 wait nat-gateway-deleted --nat-gateway-ids "$NAT" --region "$R" || sleep 30
-            echo "✅ NAT Gateway deleted"
-          done
-
-          echo "=== Elastic IPs ==="
-          EIP_ALLOCS=$(aws ec2 describe-addresses \
-            --filters "Name=tag:Name,Values=${{ env.NAME_PREFIX }}-nat-eip" \
-            --region "$R" \
-            --query "Addresses[*].AllocationId" \
-            --output text 2>/dev/null)
-
-          for ALLOC in $EIP_ALLOCS; do
-            aws ec2 release-address --allocation-id "$ALLOC" --region "$R" \
-              && echo "✅ Released EIP: $ALLOC" || echo "⚠️ Could not release $ALLOC"
-          done
-
-      - name: "4. VPC — subnets, route tables, IGW, security groups, VPC"
+      - name: "3. NAT Gateways + Elastic IPs (billed hourly -- delete first)"
         continue-on-error: true
         run: |
           R="${{ env.TARGET_REGION }}"
@@ -396,26 +360,70 @@ jobs:
           VPC_ID=$(aws ec2 describe-vpcs \
             --filters "Name=tag:Name,Values=${{ env.NAME_PREFIX }}-vpc" \
             --region "$R" \
-            --query "Vpcs[0].VpcId" \
+            --query "Vpcs[0].VpcId" --output text 2>/dev/null)
+
+          NAT_IDS=$(aws ec2 describe-nat-gateways \
+            --filter "Name=vpc-id,Values=$VPC_ID" \
+                     "Name=state,Values=available,pending" \
+            --region "$R" \
+            --query "NatGateways[*].NatGatewayId" \
             --output text 2>/dev/null)
 
+          for NAT in $NAT_IDS; do
+            echo "Deleting NAT Gateway: $NAT"
+            aws ec2 delete-nat-gateway --nat-gateway-id "$NAT" --region "$R" > /dev/null
+          done
+
+          if [ -n "$NAT_IDS" ]; then
+            echo "Waiting for NAT Gateways to delete..."
+            for NAT in $NAT_IDS; do
+              aws ec2 wait nat-gateway-deleted \
+                --nat-gateway-ids "$NAT" --region "$R" 2>/dev/null || sleep 90
+              echo "  NAT $NAT deleted"
+            done
+          fi
+
+          ASSOC_IDS=$(aws ec2 describe-addresses \
+            --filters "Name=domain,Values=vpc" --region "$R" \
+            --query "Addresses[?AssociationId!=null].AssociationId" \
+            --output text 2>/dev/null)
+          for ASSOC in $ASSOC_IDS; do
+            aws ec2 disassociate-address --association-id "$ASSOC" --region "$R" 2>/dev/null || true
+          done
+
+          EIP_ALLOCS=$(aws ec2 describe-addresses \
+            --filters "Name=domain,Values=vpc" --region "$R" \
+            --query "Addresses[?AssociationId==null].AllocationId" \
+            --output text 2>/dev/null)
+          for ALLOC in $EIP_ALLOCS; do
+            aws ec2 release-address --allocation-id "$ALLOC" --region "$R" 2>/dev/null \
+              && echo "  Released EIP: $ALLOC" || true
+          done
+
+      - name: "4. VPC -- subnets, IGW, route tables, security groups, VPC"
+        continue-on-error: true
+        run: |
+          R="${{ env.TARGET_REGION }}"
+
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=${{ env.NAME_PREFIX }}-vpc" \
+            --region "$R" \
+            --query "Vpcs[0].VpcId" --output text 2>/dev/null)
+
           if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
-            echo "⚠️ VPC not found — skipping"
-            exit 0
+            echo "VPC not found -- skipping"; exit 0
           fi
           echo "Found VPC: $VPC_ID"
 
-          # Subnets
-          echo "Deleting subnets..."
           aws ec2 describe-subnets \
             --filters "Name=vpc-id,Values=$VPC_ID" --region "$R" \
             --query "Subnets[*].SubnetId" --output text \
           | tr '\t' '\n' | while read -r SN; do
-            [ -n "$SN" ] && aws ec2 delete-subnet --subnet-id "$SN" --region "$R" \
-              && echo "  ✅ Deleted subnet $SN"
+            [ -n "$SN" ] && aws ec2 delete-subnet \
+              --subnet-id "$SN" --region "$R" 2>/dev/null \
+              && echo "  Deleted subnet $SN"
           done
 
-          # Internet Gateway
           IGW_ID=$(aws ec2 describe-internet-gateways \
             --filters "Name=attachment.vpc-id,Values=$VPC_ID" --region "$R" \
             --query "InternetGateways[0].InternetGatewayId" --output text 2>/dev/null)
@@ -424,66 +432,58 @@ jobs:
               --internet-gateway-id "$IGW_ID" --vpc-id "$VPC_ID" --region "$R"
             aws ec2 delete-internet-gateway \
               --internet-gateway-id "$IGW_ID" --region "$R" \
-              && echo "✅ IGW deleted"
+              && echo "IGW deleted"
           fi
 
-          # Route tables (non-main)
-          echo "Deleting route tables..."
           aws ec2 describe-route-tables \
             --filters "Name=vpc-id,Values=$VPC_ID" --region "$R" \
             --query "RouteTables[?Associations[0].Main!=\`true\`].RouteTableId" \
             --output text \
           | tr '\t' '\n' | while read -r RT; do
-            [ -n "$RT" ] && aws ec2 delete-route-table --route-table-id "$RT" --region "$R" \
-              && echo "  ✅ Deleted route table $RT"
+            [ -n "$RT" ] && aws ec2 delete-route-table \
+              --route-table-id "$RT" --region "$R" 2>/dev/null \
+              && echo "  Deleted route table $RT"
           done
 
-          # Security groups (non-default)
-          echo "Deleting security groups..."
           aws ec2 describe-security-groups \
             --filters "Name=vpc-id,Values=$VPC_ID" --region "$R" \
             --query "SecurityGroups[?GroupName!='default'].GroupId" \
             --output text \
           | tr '\t' '\n' | while read -r SG; do
-            [ -n "$SG" ] && aws ec2 delete-security-group --group-id "$SG" --region "$R" \
-              && echo "  ✅ Deleted SG $SG"
+            [ -n "$SG" ] && aws ec2 delete-security-group \
+              --group-id "$SG" --region "$R" 2>/dev/null \
+              && echo "  Deleted SG $SG"
           done
 
-          # VPC itself
           aws ec2 delete-vpc --vpc-id "$VPC_ID" --region "$R" \
-            && echo "✅ VPC $VPC_ID deleted" \
-            || echo "❌ VPC delete failed — may still have attached resources"
+            && echo "VPC $VPC_ID deleted" \
+            || echo "VPC delete failed -- check console for remaining dependencies"
 
-      - name: "5. Secrets Manager, CloudWatch Logs, Secrets"
+      - name: "5. Secrets Manager + CloudWatch Log Groups"
         continue-on-error: true
         run: |
           R="${{ env.TARGET_REGION }}"
 
-          echo "=== Secrets Manager ==="
           aws secretsmanager delete-secret \
             --secret-id "${{ env.PROJECT_NAME }}/${{ env.ENVIRONMENT }}/db-password" \
             --force-delete-without-recovery \
             --region "$R" 2>/dev/null \
-            && echo "✅ Secret deleted" || echo "⚠️ Secret not found"
+            && echo "Secret deleted" || echo "Secret not found"
 
-          echo "=== CloudWatch Log Groups ==="
           for LG in \
             "/ecs/${{ env.NAME_PREFIX }}/hello-world" \
             "/aws/ecs/containerinsights/${{ env.NAME_PREFIX }}-cluster/performance"; do
-            aws logs delete-log-group --log-group-name "$LG" --region "$R" 2>/dev/null \
-              && echo "✅ Deleted $LG" || echo "⚠️ Not found: $LG"
+            aws logs delete-log-group \
+              --log-group-name "$LG" --region "$R" 2>/dev/null \
+              && echo "Deleted $LG" || echo "Not found: $LG"
           done
 
-      - name: "6. IAM Roles (global — not region-specific)"
+      - name: "6. IAM Roles (global)"
         continue-on-error: true
         run: |
-          # IAM is global so region flag is not needed here
           EXEC_ROLE="${{ env.NAME_PREFIX }}-ecs-execution-role"
           TASK_ROLE="${{ env.NAME_PREFIX }}-ecs-task-role"
-          TASK_POLICY="${{ env.NAME_PREFIX }}-task-s3-policy"
 
-          echo "=== ECS Execution Role ==="
-          # Detach all managed policies first
           POLICIES=$(aws iam list-attached-role-policies \
             --role-name "$EXEC_ROLE" \
             --query "AttachedPolicies[*].PolicyArn" \
@@ -492,14 +492,13 @@ jobs:
             aws iam detach-role-policy --role-name "$EXEC_ROLE" --policy-arn "$P" 2>/dev/null
           done
           aws iam delete-role --role-name "$EXEC_ROLE" 2>/dev/null \
-            && echo "✅ Execution role deleted" || echo "⚠️ Not found"
+            && echo "Execution role deleted" || echo "Not found"
 
-          echo "=== ECS Task Role ==="
           aws iam delete-role-policy \
             --role-name "$TASK_ROLE" \
-            --policy-name "$TASK_POLICY" 2>/dev/null || true
+            --policy-name "${{ env.NAME_PREFIX }}-task-s3-policy" 2>/dev/null || true
           aws iam delete-role --role-name "$TASK_ROLE" 2>/dev/null \
-            && echo "✅ Task role deleted" || echo "⚠️ Not found"
+            && echo "Task role deleted" || echo "Not found"
 
       - name: "7. App data S3 bucket"
         continue-on-error: true
@@ -509,11 +508,9 @@ jobs:
           BUCKET="${{ env.NAME_PREFIX }}-app-data-${ACCOUNT_ID}"
 
           aws s3api head-bucket --bucket "$BUCKET" --region "$R" 2>/dev/null || {
-            echo "⚠️ Bucket not found — skipping"
-            exit 0
+            echo "Bucket not found -- skipping"; exit 0
           }
 
-          # Empty all versioned objects
           aws s3api list-object-versions \
             --bucket "$BUCKET" --region "$R" \
             --output json \
@@ -532,29 +529,27 @@ jobs:
 
           aws s3 rm "s3://$BUCKET" --recursive --region "$R" 2>/dev/null || true
           aws s3api delete-bucket --bucket "$BUCKET" --region "$R" \
-            && echo "✅ App data bucket deleted" || echo "⚠️ Bucket delete failed"
+            && echo "App data bucket deleted" || echo "Bucket delete failed"
 
       - name: Print summary
         if: always()
         run: |
-          echo "=============================================="
+          echo "================================================"
           echo "  DIRECT DELETE COMPLETE"
-          echo "  Region cleaned: ${{ env.TARGET_REGION }}"
-          echo "  Project:        ${{ env.NAME_PREFIX }}"
-          echo "  Triggered by:   ${{ github.actor }}"
-          echo ""
-          echo "  Verify in AWS Console:"
-          echo "  https://console.aws.amazon.com/vpc/home?region=${{ env.TARGET_REGION }}"
-          echo "=============================================="
+          echo "  Region: ${{ env.TARGET_REGION }}"
+          echo "  Prefix: ${{ env.NAME_PREFIX }}"
+          echo "  Triggered by: ${{ github.actor }}"
+          echo "  Verify: https://console.aws.amazon.com/vpc/home?region=${{ env.TARGET_REGION }}"
+          echo "================================================"
 
   # ============================================================================
-  # Shared Cleanup — runs after EITHER terraform-destroy OR direct-delete
+  # Shared Cleanup -- runs after EITHER job A or job B completes
   # ============================================================================
   cleanup-leftovers:
-    name: 🧹 Final Cleanup
+    name: Final Cleanup
     runs-on: ubuntu-latest
     needs: [terraform-destroy, direct-delete]
-    if: always() && (needs.terraform-destroy.result == 'success' || needs.direct-delete.result == 'success')
+    if: always() && (needs.terraform-destroy.result == 'success' || needs.direct-delete.result == 'success' || needs.terraform-destroy.result == 'skipped' || needs.direct-delete.result == 'skipped')
     env:
       TARGET_REGION: ${{ github.event.inputs.target_region }}
       NAME_PREFIX:   ${{ github.event.inputs.project_name }}-${{ github.event.inputs.environment }}
@@ -573,21 +568,28 @@ jobs:
           REPO="${{ env.NAME_PREFIX }}-hello-world"
           R="${{ env.TARGET_REGION }}"
 
-          aws ecr describe-repositories --repository-names "$REPO" --region "$R" 2>/dev/null || {
-            echo "⚠️ ECR repo not found"; exit 0
+          aws ecr describe-repositories \
+            --repository-names "$REPO" --region "$R" 2>/dev/null || {
+            echo "ECR repo not found"; exit 0
           }
-          IMAGE_IDS=$(aws ecr list-images --repository-name "$REPO" --region "$R" \
+
+          IMAGE_IDS=$(aws ecr list-images \
+            --repository-name "$REPO" --region "$R" \
             --query "imageIds[*]" --output json)
           [ "$IMAGE_IDS" != "[]" ] && aws ecr batch-delete-image \
-            --repository-name "$REPO" --image-ids "$IMAGE_IDS" --region "$R" || true
-          aws ecr delete-repository --repository-name "$REPO" --force --region "$R" \
-            && echo "✅ ECR repo deleted" || echo "⚠️ Not found"
+            --repository-name "$REPO" \
+            --image-ids "$IMAGE_IDS" \
+            --region "$R" || true
+
+          aws ecr delete-repository \
+            --repository-name "$REPO" --force --region "$R" \
+            && echo "ECR repo deleted" || echo "Not found"
 
   # ============================================================================
-  # Optional: Delete the state bucket (only when checkbox is checked)
+  # Optional: Delete the Terraform state bucket
   # ============================================================================
   destroy-state-bucket:
-    name: ☢️ Delete State Bucket
+    name: Delete State Bucket (optional)
     runs-on: ubuntu-latest
     needs: cleanup-leftovers
     if: github.event.inputs.destroy_state_bucket == 'true'
@@ -607,7 +609,8 @@ jobs:
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           BUCKET="${{ github.event.inputs.project_name }}-tfstate-${ACCOUNT_ID}"
 
-          aws s3api head-bucket --bucket "$BUCKET" --region "${{ env.STATE_REGION }}" 2>/dev/null || {
+          aws s3api head-bucket --bucket "$BUCKET" \
+            --region "${{ env.STATE_REGION }}" 2>/dev/null || {
             echo "Bucket not found"; exit 0
           }
 
@@ -624,10 +627,11 @@ jobs:
               subprocess.run(['aws','s3api','delete-objects',
                 '--bucket','$BUCKET','--region','${{ env.STATE_REGION }}',
                 '--delete', payload], check=True)
+              print(f'Deleted {len(objects)} state versions')
           "
 
           aws s3 rm "s3://$BUCKET" --recursive \
             --region "${{ env.STATE_REGION }}" 2>/dev/null || true
           aws s3api delete-bucket --bucket "$BUCKET" \
             --region "${{ env.STATE_REGION }}" \
-            && echo "✅ State bucket deleted" || echo "❌ Failed"
+            && echo "State bucket deleted" || echo "Failed to delete state bucket"
