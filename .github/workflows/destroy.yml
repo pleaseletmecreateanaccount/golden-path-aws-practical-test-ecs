@@ -242,6 +242,69 @@ jobs:
           done
           echo "Pre-destroy NAT cleanup complete"
 
+      - name: Pre-destroy -- delete VPC Endpoints and wait for ENI detach
+        continue-on-error: true
+        run: |
+          R="${{ env.TARGET_REGION }}"
+
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=${{ env.NAME_PREFIX }}-vpc" \
+            --region "$R" \
+            --query "Vpcs[0].VpcId" \
+            --output text 2>/dev/null)
+
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+            echo "No VPC found -- skipping VPC endpoint pre-delete"
+            exit 0
+          fi
+
+          # Find all VPC endpoints (Interface and Gateway types) in this VPC
+          ENDPOINT_IDS=$(aws ec2 describe-vpc-endpoints \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+                      "Name=vpc-endpoint-state,Values=available,pending,pending-acceptance" \
+            --region "$R" \
+            --query "VpcEndpoints[*].VpcEndpointId" \
+            --output text 2>/dev/null)
+
+          if [ -z "$ENDPOINT_IDS" ]; then
+            echo "No VPC endpoints found"
+          else
+            echo "Deleting VPC endpoints: $ENDPOINT_IDS"
+            # Convert space-separated IDs to comma-separated for the CLI
+            ID_LIST=$(echo "$ENDPOINT_IDS" | tr ' \t' '\n' | tr '\n' ' ')
+            aws ec2 delete-vpc-endpoints \
+              --vpc-endpoint-ids $ID_LIST \
+              --region "$R" > /dev/null \
+              && echo "  Delete request sent for: $ID_LIST"
+
+            # Interface endpoints create ENIs in subnets -- wait for them to detach
+            # before Terraform tries to delete subnets and security groups
+            echo "Waiting for Interface endpoint ENIs to detach (up to 3 min)..."
+            WAIT=0
+            while [ $WAIT -lt 180 ]; do
+              REMAINING=$(aws ec2 describe-vpc-endpoints \
+                --filters "Name=vpc-id,Values=$VPC_ID" \
+                          "Name=vpc-endpoint-state,Values=deleting,pending,available" \
+                --region "$R" \
+                --query "length(VpcEndpoints)" \
+                --output text 2>/dev/null || echo "0")
+
+              if [ "$REMAINING" = "0" ] || [ "$REMAINING" = "None" ]; then
+                echo "  All VPC endpoints deleted"
+                break
+              fi
+
+              echo "  Still deleting ($REMAINING remaining)... waiting 15s"
+              sleep 15
+              WAIT=$((WAIT + 15))
+            done
+
+            # Extra buffer for ENI detach to propagate to subnet/SG state
+            echo "Waiting additional 30s for ENIs to fully detach from subnets..."
+            sleep 30
+          fi
+          echo "Pre-destroy VPC endpoint cleanup complete"
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
