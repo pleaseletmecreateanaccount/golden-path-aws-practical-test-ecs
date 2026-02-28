@@ -6,51 +6,6 @@ Covers all requirements: networking, compute, security, secrets, CI/CD, auto sca
 ---
 ![Golden Path ECS High Level Architecture](golden-path-architecture.png)
 
-## Architecture Overview
-
-```
-                          ┌──────────────────────────────────────────────────────────────┐
-                          │                        AWS Region (us-east-1)                │
-                          │                                                              │
-  Internet ──── HTTPS ───►│  ┌──────────────── VPC (10.0.0.0/16) ──────────────────┐   │
-                          │  │                                                       │   │
-                          │  │  ┌─── Public Subnets ──────────────────────────────┐ │   │
-                          │  │  │  AZ-1 (10.0.101.0/24)  AZ-2 (10.0.102.0/24)   │ │   │
-                          │  │  │  ┌────────────────────────────────────────────┐ │ │   │
-                          │  │  │  │      Application Load Balancer (ALB)       │ │ │   │
-                          │  │  │  │         HTTP :80 → Target Group            │ │ │   │
-                          │  │  │  └─────────────────┬──────────────────────────┘ │ │   │
-                          │  │  │                    │ NAT Gateway (AZ-1)         │ │   │
-                          │  │  └────────────────────┼────────────────────────────┘ │   │
-                          │  │                       │                               │   │
-                          │  │  ┌─── Private Subnets ┼─────────────────────────────┐│   │
-                          │  │  │  AZ-1 (10.0.1.0/24)│ AZ-2 (10.0.2.0/24)        ││   │
-                          │  │  │  ┌─────────────────▼──────────────────────────┐ ││   │
-                          │  │  │  │         ECS Fargate Cluster                │ ││   │
-                          │  │  │  │  ┌───────────────┐  ┌───────────────┐      │ ││   │
-                          │  │  │  │  │  Task (Spot)  │  │  Task (OD)   │      │ ││   │
-                          │  │  │  │  │  nginx:alpine │  │  nginx:alpine│      │ ││   │
-                          │  │  │  │  │  CPU: 0.25    │  │  CPU: 0.25   │      │ ││   │
-                          │  │  │  │  │  Mem: 512 MB  │  │  Mem: 512 MB │      │ ││   │
-                          │  │  │  │  └───────────────┘  └───────────────┘      │ ││   │
-                          │  │  │  │         ↕ Auto Scaling (CPU>60%)           │ ││   │
-                          │  │  │  └────────────────────────────────────────────┘ ││   │
-                          │  │  └──────────────────────────────────────────────────┘│   │
-                          │  │                                                       │   │
-                          │  │  VPC Endpoints: ECR API/DKR, S3, CloudWatch, Secrets │   │
-                          │  └───────────────────────────────────────────────────────┘  │
-                          │                                                              │
-                          │  ┌─────────────┐  ┌──────────────┐  ┌────────────────────┐ │
-                          │  │  S3 Bucket  │  │   DynamoDB   │  │  Secrets Manager   │ │
-                          │  │  (TF State) │  │  (TF Locks)  │  │  DB_PASSWORD       │ │
-                          │  │  (App Data) │  │              │  │  → injected as ENV │ │
-                          │  └─────────────┘  └──────────────┘  └────────────────────┘ │
-                          │                                                              │
-                          │  ┌─────────────────────────────────────────────────────┐    │
-                          │  │  CloudWatch — 4 Golden Signals Dashboard            │    │
-                          │  │  Latency (p95) | Traffic (RPS) | Errors | Saturation│   │
-                          │  └─────────────────────────────────────────────────────┘    │
-                          └──────────────────────────────────────────────────────────────┘
 
   GitHub Actions:
   push to main → terraform plan → terraform apply → ecs update-service → ecs wait stable
