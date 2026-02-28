@@ -7,9 +7,12 @@ Covers all requirements: networking, compute, security, secrets, CI/CD, auto sca
 ![Golden Path ECS High Level Architecture](golden-path-architecture.png)
 
 
-  GitHub Actions:
-  push to main → terraform plan → terraform apply → ecs update-service → ecs wait stable
-```
+GitHub Actions:
+push to main
+   → terraform plan
+   → terraform apply
+   → ecs update-service
+   → ecs wait stable
 
 ---
 
@@ -29,6 +32,7 @@ golden-path/
 │
 ├── .github/workflows/
 │   └── deploy.yml          # CI/CD: Plan → Apply → ECS Deploy
+|   └── destroy.yml         # CI/CD: Added to destroy resources to avoid costing   
 │
 ├── backend.tf              # Remote state config (update after bootstrap)
 ├── provider.tf             # AWS provider + Terraform version
@@ -186,25 +190,6 @@ CPU drops below 60% for 300 seconds
 | **Errors** | `ALB HTTPCode_Target_5XX_Count` | 4xx + 5xx counts |
 | **Saturation** | `ECS CPUUtilization` + `MemoryUtilization` | % utilization with scale-out threshold annotations |
 
----
-
-## Cost Breakdown (us-east-1, Dev workload)
-
-| Service | Config | Estimated Cost |
-|---|---|---|
-| ECS Cluster | Control plane | **FREE** |
-| Fargate Spot | 1 task × 0.25 vCPU × 512 MB | ~$1–3/mo |
-| Fargate On-Demand | 1 task × 0.25 vCPU × 512 MB | ~$5–7/mo |
-| ALB | 1 ALB, low traffic | ~$6/mo |
-| NAT Gateway | 1 NAT, ~1 GB/day | ~$33/mo |
-| S3 (state + data) | < 1 GB | FREE (12 mo) |
-| DynamoDB (lock) | On-demand, negligible ops | FREE (always) |
-| Secrets Manager | 1 secret | $0.40/mo (after 30-day trial) |
-| CloudWatch | Basic metrics + 1 dashboard | FREE |
-| VPC / Subnets / IGW | — | **FREE** |
-
-**💡 Biggest cost item: NAT Gateway (~$33/mo)**
-For a zero-cost dev setup, set `enable_nat_gateway = false` in the networking module. Fargate will use the VPC interface endpoints (ECR, Secrets Manager, CloudWatch) for AWS API calls and the S3 gateway endpoint for image layers — eliminating the NAT Gateway entirely.
 
 ---
 
@@ -224,12 +209,6 @@ aws ecs update-service \
 ```
 
 ---
-
-## GitHub Actions Setup
-
-1. Create an IAM OIDC Identity Provider for `token.actions.githubusercontent.com`
-2. Create an IAM role with a trust policy scoped to your repo
-3. Add these GitHub Secrets to your repository:
 
 | Secret | Value |
 |---|---|
