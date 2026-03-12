@@ -2,19 +2,15 @@
 # Root Orchestrator — wires all modules together
 # ==============================================================================
 
-resource "random_string" "s3_suffix" {
-  length  = 6
-  special = false
-  upper   = false
-}
+
 
 locals {
   name_prefix = "${var.project_name}-${var.environment}"
   account_id  = data.aws_caller_identity.current.account_id
   region      = data.aws_region.current.name
 
-  # S3 bucket for app data (IRSA-equivalent access) — add random suffix to avoid name collisions
-  app_s3_bucket = var.app_s3_bucket_name != "" ? var.app_s3_bucket_name : "${local.name_prefix}-app-data-${local.account_id}-${random_string.s3_suffix.result}"
+  # S3 bucket for app data (IRSA-equivalent access) 
+  app_s3_bucket = var.app_s3_bucket_name != "" ? var.app_s3_bucket_name : "${local.name_prefix}-app-data-${local.account_id}-ecs"
 }
 
 # ------------------------------------------------------------------------------

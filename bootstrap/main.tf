@@ -18,10 +18,6 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
-    random = {
-      source  = "hashicorp/random"
-      version = "~> 3.0"
-    }
   }
 }
 
@@ -45,14 +41,9 @@ variable "project_name" {
 
 data "aws_caller_identity" "current" {}
 
-resource "random_string" "bucket_suffix" {
-  length  = 8
-  special = false
-  upper   = false
-}
 
 resource "aws_s3_bucket" "tfstate" {
-  bucket = "${var.project_name}-tfstate-${data.aws_caller_identity.current.account_id}-${random_string.bucket_suffix.result}"
+  bucket = "${var.project_name}-tfstate-${data.aws_caller_identity.current.account_id}-ecs"
 
   lifecycle {
     prevent_destroy = true
