@@ -15,8 +15,8 @@
 # Required GitHub Secrets:
 #   AWS_ROLE_ARN      -- OIDC-federated IAM role
 #   AWS_REGION        -- Region where your state bucket AND real infra live
-#   TF_STATE_BUCKET   -- e.g. golden-path-tfstate-825566110381
-#   TF_STATE_DYNAMODB -- e.g. golden-path-terraform-locks
+#   TF_STATE_BUCKET   -- e.g. golden-path-tfstate-825566110381-ecs
+#   TF_STATE_DYNAMODB -- e.g. golden-path-tfstate-lock
 # ==============================================================================
 
 name: Golden Path -- DESTROY ALL RESOURCES
@@ -43,6 +43,18 @@ on:
 
       destroy_state_bucket:
         description: "Also delete the Terraform state S3 bucket? (WARNING: permanent)"
+        required: true
+        type: boolean
+        default: false
+
+      destroy_dynamodb:
+        description: "Also delete the DynamoDB state lock table? (WARNING: permanent)"
+        required: true
+        type: boolean
+        default: false
+
+      destroy_secrets:
+        description: "Force-delete Secrets Manager secret immediately? (no recovery window)"
         required: true
         type: boolean
         default: false
@@ -165,6 +177,41 @@ jobs:
             echo "Service not found -- skipping"
           fi
 
+      - name: Pre-destroy -- force-delete Secrets Manager secret
+        # Runs when destroy_secrets = true
+        # Immediately removes the secret so terraform destroy does not leave
+        # it in "pending deletion" state where the name stays reserved for
+        # 7-30 days and blocks the next terraform apply from recreating it.
+        if: github.event.inputs.destroy_secrets == 'true'
+        continue-on-error: true
+        run: |
+          R="${{ env.TARGET_REGION }}"
+          SECRET_ID="${{ env.PROJECT_NAME }}/${{ env.ENVIRONMENT }}/db-password"
+
+          STATUS=$(aws secretsmanager describe-secret \
+            --secret-id "$SECRET_ID" \
+            --region "$R" \
+            --query "DeletedDate" \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+
+          if [ "$STATUS" = "NOT_FOUND" ]; then
+            echo "Secret not found -- skipping"
+          elif [ "$STATUS" != "None" ] && [ -n "$STATUS" ]; then
+            echo "Secret already scheduled for deletion -- forcing immediate delete"
+            aws secretsmanager delete-secret \
+              --secret-id "$SECRET_ID" \
+              --force-delete-without-recovery \
+              --region "$R" \
+              && echo "Secret force-deleted"
+          else
+            echo "Secret exists -- force-deleting immediately (no recovery window)"
+            aws secretsmanager delete-secret \
+              --secret-id "$SECRET_ID" \
+              --force-delete-without-recovery \
+              --region "$R" \
+              && echo "Secret force-deleted: $SECRET_ID"
+          fi
+
       - name: Pre-destroy -- delete NAT Gateways and release EIPs
         continue-on-error: true
         run: |
@@ -182,7 +229,6 @@ jobs:
           fi
           echo "Found VPC: $VPC_ID"
 
-          # Delete all active NAT Gateways in this VPC
           NAT_IDS=$(aws ec2 describe-nat-gateways \
             --filter "Name=vpc-id,Values=$VPC_ID" \
                      "Name=state,Values=available,pending" \
@@ -200,7 +246,6 @@ jobs:
                 --region "$R" > /dev/null
             done
 
-            # CRITICAL: wait for full deletion before Terraform touches subnets/IGW
             echo "Waiting for NAT Gateways to fully delete (this takes ~2 min)..."
             for NAT in $NAT_IDS; do
               aws ec2 wait nat-gateway-deleted \
@@ -210,7 +255,6 @@ jobs:
             done
           fi
 
-          # Disassociate any still-mapped EIPs (causes IGW detach to fail)
           echo "Disassociating mapped EIPs..."
           ASSOC_IDS=$(aws ec2 describe-addresses \
             --filters "Name=domain,Values=vpc" \
@@ -225,7 +269,6 @@ jobs:
               && echo "  Disassociated: $ASSOC" || true
           done
 
-          # Release all unassociated EIPs
           echo "Releasing unassociated EIPs..."
           EIP_ALLOCS=$(aws ec2 describe-addresses \
             --filters "Name=domain,Values=vpc" \
@@ -258,7 +301,6 @@ jobs:
             exit 0
           fi
 
-          # Find all VPC endpoints (Interface and Gateway types) in this VPC
           ENDPOINT_IDS=$(aws ec2 describe-vpc-endpoints \
             --filters "Name=vpc-id,Values=$VPC_ID" \
                       "Name=vpc-endpoint-state,Values=available,pending,pending-acceptance" \
@@ -270,15 +312,12 @@ jobs:
             echo "No VPC endpoints found"
           else
             echo "Deleting VPC endpoints: $ENDPOINT_IDS"
-            # Convert space-separated IDs to comma-separated for the CLI
             ID_LIST=$(echo "$ENDPOINT_IDS" | tr ' \t' '\n' | tr '\n' ' ')
             aws ec2 delete-vpc-endpoints \
               --vpc-endpoint-ids $ID_LIST \
               --region "$R" > /dev/null \
               && echo "  Delete request sent for: $ID_LIST"
 
-            # Interface endpoints create ENIs in subnets -- wait for them to detach
-            # before Terraform tries to delete subnets and security groups
             echo "Waiting for Interface endpoint ENIs to detach (up to 3 min)..."
             WAIT=0
             while [ $WAIT -lt 180 ]; do
@@ -299,7 +338,6 @@ jobs:
               WAIT=$((WAIT + 15))
             done
 
-            # Extra buffer for ENI detach to propagate to subnet/SG state
             echo "Waiting additional 30s for ENIs to fully detach from subnets..."
             sleep 30
           fi
@@ -330,8 +368,6 @@ jobs:
   # ============================================================================
   # Job B: Direct AWS CLI Delete
   # Runs when target_region != secrets.AWS_REGION (mode = direct)
-  # Orphaned resources were never written to Terraform state so Terraform
-  # cannot see them -- delete each resource type directly via AWS CLI.
   # ============================================================================
   direct-delete:
     name: Direct AWS CLI Delete (orphaned resources)
@@ -463,7 +499,34 @@ jobs:
               && echo "  Released EIP: $ALLOC" || true
           done
 
-      - name: "4. VPC -- subnets, IGW, route tables, security groups, VPC"
+      - name: "4. Secrets Manager -- force-delete to prevent name reservation"
+        # Always force-deletes in direct mode since these are orphaned resources.
+        # Without --force-delete-without-recovery the name stays reserved for
+        # up to 30 days and blocks the next terraform apply from recreating it.
+        if: github.event.inputs.destroy_secrets == 'true'
+        continue-on-error: true
+        run: |
+          R="${{ env.TARGET_REGION }}"
+          SECRET_ID="${{ env.PROJECT_NAME }}/${{ env.ENVIRONMENT }}/db-password"
+
+          STATUS=$(aws secretsmanager describe-secret \
+            --secret-id "$SECRET_ID" \
+            --region "$R" \
+            --query "DeletedDate" \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+
+          if [ "$STATUS" = "NOT_FOUND" ]; then
+            echo "Secret not found -- skipping"
+          else
+            echo "Force-deleting secret: $SECRET_ID"
+            aws secretsmanager delete-secret \
+              --secret-id "$SECRET_ID" \
+              --force-delete-without-recovery \
+              --region "$R" \
+              && echo "Secret deleted immediately (no recovery window)"
+          fi
+
+      - name: "5. VPC -- subnets, IGW, route tables, security groups, VPC"
         continue-on-error: true
         run: |
           R="${{ env.TARGET_REGION }}"
@@ -522,16 +585,10 @@ jobs:
             && echo "VPC $VPC_ID deleted" \
             || echo "VPC delete failed -- check console for remaining dependencies"
 
-      - name: "5. Secrets Manager + CloudWatch Log Groups"
+      - name: "6. CloudWatch Log Groups"
         continue-on-error: true
         run: |
           R="${{ env.TARGET_REGION }}"
-
-          aws secretsmanager delete-secret \
-            --secret-id "${{ env.PROJECT_NAME }}/${{ env.ENVIRONMENT }}/db-password" \
-            --force-delete-without-recovery \
-            --region "$R" 2>/dev/null \
-            && echo "Secret deleted" || echo "Secret not found"
 
           for LG in \
             "/ecs/${{ env.NAME_PREFIX }}/hello-world" \
@@ -541,7 +598,7 @@ jobs:
               && echo "Deleted $LG" || echo "Not found: $LG"
           done
 
-      - name: "6. IAM Roles (global)"
+      - name: "7. IAM Roles (global)"
         continue-on-error: true
         run: |
           EXEC_ROLE="${{ env.NAME_PREFIX }}-ecs-execution-role"
@@ -563,12 +620,12 @@ jobs:
           aws iam delete-role --role-name "$TASK_ROLE" 2>/dev/null \
             && echo "Task role deleted" || echo "Not found"
 
-      - name: "7. App data S3 bucket"
+      - name: "8. App data S3 bucket"
         continue-on-error: true
         run: |
           R="${{ env.TARGET_REGION }}"
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          BUCKET="${{ env.NAME_PREFIX }}-app-data-${ACCOUNT_ID}"
+          BUCKET="${{ env.NAME_PREFIX }}-app-data-${ACCOUNT_ID}-ecs"
 
           aws s3api head-bucket --bucket "$BUCKET" --region "$R" 2>/dev/null || {
             echo "Bucket not found -- skipping"; exit 0
@@ -606,7 +663,8 @@ jobs:
           echo "================================================"
 
   # ============================================================================
-  # Shared Cleanup -- runs after EITHER job A or job B completes
+  # Shared Cleanup -- runs after EITHER job A or job B completes successfully
+  # FIXED: condition checks actual success, not just skipped state
   # ============================================================================
   cleanup-leftovers:
     name: Final Cleanup
@@ -617,7 +675,6 @@ jobs:
         needs.terraform-destroy.result == 'success' ||
         needs.direct-delete.result == 'success'
       )
-
     env:
       TARGET_REGION: ${{ github.event.inputs.target_region }}
       NAME_PREFIX:   ${{ github.event.inputs.project_name }}-${{ github.event.inputs.environment }}
@@ -654,7 +711,83 @@ jobs:
             && echo "ECR repo deleted" || echo "Not found"
 
   # ============================================================================
-  # Optional: Delete the Terraform state bucket
+  # Optional: Delete the DynamoDB state lock table
+  # FIXED: always() breaks skip propagation from cleanup-leftovers
+  # ============================================================================
+  destroy-dynamodb:
+    name: Delete DynamoDB Lock Table (optional)
+    runs-on: ubuntu-latest
+    needs: cleanup-leftovers
+    if: |
+      always() &&
+      needs.cleanup-leftovers.result == 'success' &&
+      github.event.inputs.destroy_dynamodb == 'true'
+    env:
+      STATE_REGION: ${{ secrets.AWS_REGION }}
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:        ${{ secrets.AWS_REGION }}
+          role-session-name: GitHubActions-DestroyDynamoDB
+
+      - name: Check and delete DynamoDB table
+        run: |
+          TABLE="${{ secrets.TF_STATE_DYNAMODB }}"
+          R="${{ env.STATE_REGION }}"
+
+          # Verify the table actually exists before attempting delete
+          STATUS=$(aws dynamodb describe-table \
+            --table-name "$TABLE" \
+            --region "$R" \
+            --query "Table.TableStatus" \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+
+          if [ "$STATUS" = "NOT_FOUND" ]; then
+            echo "DynamoDB table '$TABLE' not found -- nothing to delete"
+            exit 0
+          fi
+
+          echo "Found table: $TABLE (status: $STATUS)"
+
+          # Wait if table is in a transitional state
+          if [ "$STATUS" != "ACTIVE" ]; then
+            echo "Table not ACTIVE -- waiting..."
+            aws dynamodb wait table-exists \
+              --table-name "$TABLE" \
+              --region "$R"
+          fi
+
+          aws dynamodb delete-table \
+            --table-name "$TABLE" \
+            --region "$R" \
+            && echo "Delete request sent for: $TABLE"
+
+          # Wait for full deletion before proceeding
+          echo "Waiting for table to be fully deleted..."
+          aws dynamodb wait table-not-exists \
+            --table-name "$TABLE" \
+            --region "$R" \
+            && echo "DynamoDB table deleted: $TABLE"
+
+      - name: Remind to update GitHub Secrets
+        run: |
+          echo "============================================================"
+          echo "  DynamoDB table deleted: ${{ secrets.TF_STATE_DYNAMODB }}"
+          echo ""
+          echo "  ACTION REQUIRED before next terraform apply:"
+          echo "  Update GitHub Secret TF_STATE_DYNAMODB with the new"
+          echo "  table name after running bootstrap again."
+          echo ""
+          echo "  Or if upgrading to Terraform >= 1.10, you can remove"
+          echo "  TF_STATE_DYNAMODB entirely -- S3 native locking replaces it."
+          echo "============================================================"
+
+  # ============================================================================
+  # Optional: Delete the Terraform state S3 bucket
+  # FIXED: always() breaks skip propagation, explicit success guard added
   # ============================================================================
   destroy-state-bucket:
     name: Delete State Bucket (optional)
@@ -668,99 +801,98 @@ jobs:
       STATE_REGION: ${{ secrets.AWS_REGION }}
 
     steps:
-    - name: Configure AWS credentials (OIDC)
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
-        aws-region:        ${{ secrets.AWS_REGION }}
-        role-session-name: GitHubActions-DestroyStateBucket
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:        ${{ secrets.AWS_REGION }}
+          role-session-name: GitHubActions-DestroyStateBucket
 
-    - name: Resolve state bucket name from AWS
-      id: bucket
-      run: |
-        ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - name: Resolve state bucket name from AWS
+        id: bucket
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
-        # Try to find the bucket by tag rather than by assumed name
-        BUCKET=$(aws s3api list-buckets \
-          --query "Buckets[*].Name" \
-          --output text | tr '\t' '\n' | while read -r B; do
-            TAGS=$(aws s3api get-bucket-tagging --bucket "$B" \
-              --region "${{ env.STATE_REGION }}" 2>/dev/null || echo "")
-            if echo "$TAGS" | grep -q '"Purpose"' && \
-               echo "$TAGS" | grep -q 'Terraform remote state'; then
-              echo "$B"
-            fi
-          done | head -1)
+          # Try to find the bucket by tag first
+          BUCKET=$(aws s3api list-buckets \
+            --query "Buckets[*].Name" \
+            --output text | tr '\t' '\n' | while read -r B; do
+              TAGS=$(aws s3api get-bucket-tagging --bucket "$B" \
+                --region "${{ env.STATE_REGION }}" 2>/dev/null || echo "")
+              if echo "$TAGS" | grep -q '"Purpose"' && \
+                 echo "$TAGS" | grep -q 'Terraform remote state'; then
+                echo "$B"
+              fi
+            done | head -1)
 
-        # Fall back to the naming convention if tag lookup fails
-        if [ -z "$BUCKET" ]; then
-          BUCKET="${{ github.event.inputs.project_name }}-tfstate-${ACCOUNT_ID}"
-          echo "Tag lookup failed, falling back to convention: $BUCKET"
-        fi
+          # Fall back to naming convention
+          if [ -z "$BUCKET" ]; then
+            BUCKET="${{ github.event.inputs.project_name }}-tfstate-${ACCOUNT_ID}-ecs"
+            echo "Tag lookup failed, falling back to convention: $BUCKET"
+          fi
 
-        echo "bucket=$BUCKET" >> $GITHUB_OUTPUT
-        echo "Resolved bucket: $BUCKET"
+          echo "bucket=$BUCKET" >> $GITHUB_OUTPUT
+          echo "Resolved bucket: $BUCKET"
 
-    - name: Verify bucket exists before attempting delete
-      run: |
-        aws s3api head-bucket \
-          --bucket "${{ steps.bucket.outputs.bucket }}" \
-          --region "${{ env.STATE_REGION }}" 2>/dev/null || {
-          echo "Bucket ${{ steps.bucket.outputs.bucket }} not found — nothing to delete"
-          exit 0
-        }
+      - name: Verify bucket exists
+        run: |
+          aws s3api head-bucket \
+            --bucket "${{ steps.bucket.outputs.bucket }}" \
+            --region "${{ env.STATE_REGION }}" 2>/dev/null || {
+            echo "Bucket not found -- nothing to delete"
+            exit 0
+          }
 
-    - name: Empty and delete Terraform state bucket
-      run: |
-        BUCKET="${{ steps.bucket.outputs.bucket }}"
-        REGION="${{ env.STATE_REGION }}"
+      - name: Empty and delete Terraform state bucket
+        run: |
+          BUCKET="${{ steps.bucket.outputs.bucket }}"
+          REGION="${{ env.STATE_REGION }}"
 
-        echo "Emptying bucket: $BUCKET"
+          echo "Emptying bucket: $BUCKET"
 
-        # Delete all versioned objects
-        aws s3api list-object-versions \
-          --bucket "$BUCKET" \
-          --region "$REGION" \
-          --output json \
-          --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
-        | python3 -c "
-        import sys, json, subprocess
-        data = json.load(sys.stdin)
-        objects = data.get('Objects') or []
-        if objects:
-            payload = json.dumps({'Objects': objects, 'Quiet': True})
-            subprocess.run(['aws','s3api','delete-objects',
-                '--bucket','$BUCKET','--region','$REGION',
-                '--delete', payload], check=True)
-            print(f'Deleted {len(objects)} versioned objects')
-        else:
-            print('No versioned objects found')
-        "
+          # Delete all versioned objects
+          aws s3api list-object-versions \
+            --bucket "$BUCKET" \
+            --region "$REGION" \
+            --output json \
+            --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+          | python3 -c "
+          import sys, json, subprocess
+          data = json.load(sys.stdin)
+          objects = data.get('Objects') or []
+          if objects:
+              payload = json.dumps({'Objects': objects, 'Quiet': True})
+              subprocess.run(['aws','s3api','delete-objects',
+                  '--bucket','$BUCKET','--region','$REGION',
+                  '--delete', payload], check=True)
+              print(f'Deleted {len(objects)} versioned objects')
+          else:
+              print('No versioned objects found')
+          "
 
-        # Delete all delete markers
-        aws s3api list-object-versions \
-          --bucket "$BUCKET" \
-          --region "$REGION" \
-          --output json \
-          --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
-        | python3 -c "
-        import sys, json, subprocess
-        data = json.load(sys.stdin)
-        objects = data.get('Objects') or []
-        if objects:
-            payload = json.dumps({'Objects': objects, 'Quiet': True})
-            subprocess.run(['aws','s3api','delete-objects',
-                '--bucket','$BUCKET','--region','$REGION',
-                '--delete', payload], check=True)
-            print(f'Deleted {len(objects)} delete markers')
-        "
+          # Delete all delete markers
+          aws s3api list-object-versions \
+            --bucket "$BUCKET" \
+            --region "$REGION" \
+            --output json \
+            --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+          | python3 -c "
+          import sys, json, subprocess
+          data = json.load(sys.stdin)
+          objects = data.get('Objects') or []
+          if objects:
+              payload = json.dumps({'Objects': objects, 'Quiet': True})
+              subprocess.run(['aws','s3api','delete-objects',
+                  '--bucket','$BUCKET','--region','$REGION',
+                  '--delete', payload], check=True)
+              print(f'Deleted {len(objects)} delete markers')
+          "
 
-        # Final sweep for any remaining unversioned objects
-        aws s3 rm "s3://$BUCKET" --recursive --region "$REGION" 2>/dev/null || true
+          # Final sweep for any remaining objects
+          aws s3 rm "s3://$BUCKET" --recursive --region "$REGION" 2>/dev/null || true
 
-        # Delete the bucket itself
-        aws s3api delete-bucket \
-          --bucket "$BUCKET" \
-          --region "$REGION" \
-          && echo "✓ State bucket deleted: $BUCKET" \
-          || { echo "✗ Failed to delete bucket — check for remaining objects"; exit 1; }
+          aws s3api delete-bucket \
+            --bucket "$BUCKET" \
+            --region "$REGION" \
+            && echo "State bucket deleted: $BUCKET" \
+            || { echo "Failed to delete bucket -- check for remaining objects"; exit 1; }
