@@ -38,8 +38,7 @@ resource "aws_secretsmanager_secret" "db_password" {
   name        = var.db_password_secret_name
   description = "Database password for ${var.name_prefix} application"
 
-  # How long to wait before permanent deletion (set to 0 for dev to save cost)
-  recovery_window_in_days = 7
+  recovery_window_in_days = 0
 
   tags = {
     Name    = var.db_password_secret_name
