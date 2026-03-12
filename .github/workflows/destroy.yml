@@ -612,7 +612,12 @@ jobs:
     name: Final Cleanup
     runs-on: ubuntu-latest
     needs: [terraform-destroy, direct-delete]
-    if: always() && (needs.terraform-destroy.result == 'success' || needs.direct-delete.result == 'success' || needs.terraform-destroy.result == 'skipped' || needs.direct-delete.result == 'skipped')
+    if: |
+      always() && (
+        needs.terraform-destroy.result == 'success' ||
+        needs.direct-delete.result == 'success'
+      )
+
     env:
       TARGET_REGION: ${{ github.event.inputs.target_region }}
       NAME_PREFIX:   ${{ github.event.inputs.project_name }}-${{ github.event.inputs.environment }}
@@ -655,46 +660,107 @@ jobs:
     name: Delete State Bucket (optional)
     runs-on: ubuntu-latest
     needs: cleanup-leftovers
-    if: github.event.inputs.destroy_state_bucket == 'true'
+    if: |
+      always() &&
+      needs.cleanup-leftovers.result == 'success' &&
+      github.event.inputs.destroy_state_bucket == 'true'
     env:
       STATE_REGION: ${{ secrets.AWS_REGION }}
 
     steps:
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
-          aws-region:        ${{ secrets.AWS_REGION }}
-          role-session-name: GitHubActions-DestroyStateBucket
+    - name: Configure AWS credentials (OIDC)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+        aws-region:        ${{ secrets.AWS_REGION }}
+        role-session-name: GitHubActions-DestroyStateBucket
 
-      - name: Empty and delete Terraform state bucket
-        run: |
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+    - name: Resolve state bucket name from AWS
+      id: bucket
+      run: |
+        ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+        # Try to find the bucket by tag rather than by assumed name
+        BUCKET=$(aws s3api list-buckets \
+          --query "Buckets[*].Name" \
+          --output text | tr '\t' '\n' | while read -r B; do
+            TAGS=$(aws s3api get-bucket-tagging --bucket "$B" \
+              --region "${{ env.STATE_REGION }}" 2>/dev/null || echo "")
+            if echo "$TAGS" | grep -q '"Purpose"' && \
+               echo "$TAGS" | grep -q 'Terraform remote state'; then
+              echo "$B"
+            fi
+          done | head -1)
+
+        # Fall back to the naming convention if tag lookup fails
+        if [ -z "$BUCKET" ]; then
           BUCKET="${{ github.event.inputs.project_name }}-tfstate-${ACCOUNT_ID}"
+          echo "Tag lookup failed, falling back to convention: $BUCKET"
+        fi
 
-          aws s3api head-bucket --bucket "$BUCKET" \
-            --region "${{ env.STATE_REGION }}" 2>/dev/null || {
-            echo "Bucket not found"; exit 0
-          }
+        echo "bucket=$BUCKET" >> $GITHUB_OUTPUT
+        echo "Resolved bucket: $BUCKET"
 
-          aws s3api list-object-versions \
-            --bucket "$BUCKET" --region "${{ env.STATE_REGION }}" \
-            --output json \
-            --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
-          | python3 -c "
-          import sys, json, subprocess
-          data = json.load(sys.stdin)
-          objects = data.get('Objects') or []
-          if objects:
-              payload = json.dumps({'Objects': objects, 'Quiet': True})
-              subprocess.run(['aws','s3api','delete-objects',
-                '--bucket','$BUCKET','--region','${{ env.STATE_REGION }}',
+    - name: Verify bucket exists before attempting delete
+      run: |
+        aws s3api head-bucket \
+          --bucket "${{ steps.bucket.outputs.bucket }}" \
+          --region "${{ env.STATE_REGION }}" 2>/dev/null || {
+          echo "Bucket ${{ steps.bucket.outputs.bucket }} not found — nothing to delete"
+          exit 0
+        }
+
+    - name: Empty and delete Terraform state bucket
+      run: |
+        BUCKET="${{ steps.bucket.outputs.bucket }}"
+        REGION="${{ env.STATE_REGION }}"
+
+        echo "Emptying bucket: $BUCKET"
+
+        # Delete all versioned objects
+        aws s3api list-object-versions \
+          --bucket "$BUCKET" \
+          --region "$REGION" \
+          --output json \
+          --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+        | python3 -c "
+        import sys, json, subprocess
+        data = json.load(sys.stdin)
+        objects = data.get('Objects') or []
+        if objects:
+            payload = json.dumps({'Objects': objects, 'Quiet': True})
+            subprocess.run(['aws','s3api','delete-objects',
+                '--bucket','$BUCKET','--region','$REGION',
                 '--delete', payload], check=True)
-              print(f'Deleted {len(objects)} state versions')
-          "
+            print(f'Deleted {len(objects)} versioned objects')
+        else:
+            print('No versioned objects found')
+        "
 
-          aws s3 rm "s3://$BUCKET" --recursive \
-            --region "${{ env.STATE_REGION }}" 2>/dev/null || true
-          aws s3api delete-bucket --bucket "$BUCKET" \
-            --region "${{ env.STATE_REGION }}" \
-            && echo "State bucket deleted" || echo "Failed to delete state bucket"
+        # Delete all delete markers
+        aws s3api list-object-versions \
+          --bucket "$BUCKET" \
+          --region "$REGION" \
+          --output json \
+          --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+        | python3 -c "
+        import sys, json, subprocess
+        data = json.load(sys.stdin)
+        objects = data.get('Objects') or []
+        if objects:
+            payload = json.dumps({'Objects': objects, 'Quiet': True})
+            subprocess.run(['aws','s3api','delete-objects',
+                '--bucket','$BUCKET','--region','$REGION',
+                '--delete', payload], check=True)
+            print(f'Deleted {len(objects)} delete markers')
+        "
+
+        # Final sweep for any remaining unversioned objects
+        aws s3 rm "s3://$BUCKET" --recursive --region "$REGION" 2>/dev/null || true
+
+        # Delete the bucket itself
+        aws s3api delete-bucket \
+          --bucket "$BUCKET" \
+          --region "$REGION" \
+          && echo "✓ State bucket deleted: $BUCKET" \
+          || { echo "✗ Failed to delete bucket — check for remaining objects"; exit 1; }
