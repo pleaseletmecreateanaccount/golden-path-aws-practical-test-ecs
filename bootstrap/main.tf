@@ -25,7 +25,6 @@ provider "aws" {
   region = var.aws_region
 }
 
-provider "random" {}
 
 variable "aws_region" {
   description = "AWS region — must match the region in backend.tf and terraform.tfvars"

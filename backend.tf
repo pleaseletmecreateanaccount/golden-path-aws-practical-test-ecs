@@ -8,7 +8,7 @@
 
 terraform {
   backend "s3" {
-    bucket         = "golden-path-tfstate-825566110381-ux3krriu"
+    bucket         = "golden-path-tfstate-825566110381-ecs"
     key            = "golden-path/dev/terraform.tfstate"
     region         = "ap-southeast-1"
     encrypt        = true
